@@ -40,6 +40,16 @@ _APP_VERSION = (
 USER_AGENT = f"Mozilla/{_APP_VERSION}"
 ASTRUM_API = "https://solver.astrum.foundation/api"
 GATEWAY_API = "https://delta-gateway.fly.dev/api"
+_MANAGED_CF_LOCK = asyncio.Lock()
+_TASK_LIMIT_ERROR = "ACTIVE_TASKS_LIMIT_EXCEEDED"
+_TASK_CREATE_ATTEMPTS = 90
+_TASK_CREATE_DELAY = 3
+
+
+def _solver_error(res: dict) -> str:
+    code = str(res.get("errorCode") or "UNKNOWN_ERROR")
+    description = str(res.get("errorDescription") or "No description")
+    return f"{code}: {description}"
 
 
 @dataclass(frozen=True)
@@ -336,7 +346,10 @@ async def solve_managed_cf_clearance(
     if not proxy_url:
         raise RuntimeError("Proxy is required for Cloudflare Managed Challenge")
 
-    async with AsyncSession(timeout=(10, 60)) as session:
+    # Astrum limits active tasks per API key. Account initialization is concurrent,
+    # while the shared gateway uses one key for all requests, so serialize the full
+    # create/poll flow within this process.
+    async with _MANAGED_CF_LOCK, AsyncSession(timeout=(10, 60)) as session:
         task = {
             "type": "cf_clearance",
             "websiteURL": target_url,
@@ -344,23 +357,34 @@ async def solve_managed_cf_clearance(
             "userAgent": USER_AGENT,
         }
 
-        rep = await session.post(
-            f"{solver_api}/createTask", json={"clientKey": api_key, "task": task}
-        )
-        res = rep.json()
-        if res.get("errorCode") == "NO_FUNDS":
-            if api_key:
+        for attempt in range(1, _TASK_CREATE_ATTEMPTS + 1):
+            rep = await session.post(
+                f"{solver_api}/createTask", json={"clientKey": api_key, "task": task}
+            )
+            res = rep.json()
+            if res.get("errorCode") == "NO_FUNDS":
+                if api_key:
+                    raise RuntimeError(
+                        "Your Astrum account is out of funds. Top it up: "
+                        "https://solver.astrum.foundation/"
+                    )
                 raise RuntimeError(
-                    "Your Astrum account is out of funds. Top it up: "
+                    "Shared Cloudflare solver is out of funds. Report it at "
+                    "https://t.me/eazyrekt or configure your own Astrum captcha_key: "
                     "https://solver.astrum.foundation/"
                 )
-            raise RuntimeError(
-                "Shared Cloudflare solver is out of funds. Report it at "
-                "https://t.me/eazyrekt or configure your own Astrum captcha_key: "
-                "https://solver.astrum.foundation/"
-            )
+            if res.get("errorCode") != _TASK_LIMIT_ERROR:
+                break
+            if attempt == _TASK_CREATE_ATTEMPTS:
+                raise RuntimeError(f"Cloudflare task creation failed: {_solver_error(res)}")
+            if attempt == 1 or attempt % 10 == 0:
+                logger.debug("Cloudflare solver is busy; waiting for an active task to finish")
+            await asyncio.sleep(_TASK_CREATE_DELAY)
+
         if res.get("errorId", 0) != 0 or not res.get("taskId"):
-            raise RuntimeError(f"Cloudflare task creation failed: {res}")
+            error = _solver_error(res)
+            logger.error(f"Cloudflare task creation failed: {error}")
+            raise RuntimeError(f"Cloudflare task creation failed: {error}")
 
         task_id = res["taskId"]
         logger.debug(f"Cloudflare task {task_id} created")
@@ -389,6 +413,8 @@ async def solve_managed_cf_clearance(
                 logger.debug(f"Cloudflare task {task_id} solved")
                 return
 
-            raise RuntimeError(f"Cloudflare task failed: {res}")
+            error = _solver_error(res)
+            logger.error(f"Cloudflare task failed: {error}")
+            raise RuntimeError(f"Cloudflare task failed: {error}")
 
     raise RuntimeError("Cloudflare task timed out")

@@ -159,6 +159,73 @@ def test_pnl_mismatch_warns(monkeypatch):
         "Unexpected P/L change: expected -0.22, actual -20.22, Δ -20.00. Possible balance movement."
     )
 
+async def test_cli_close_continues_after_position_and_account_failures():
+    from strategy.runner import close_all
+
+    class CloseClient(Client):
+        def __init__(self, name: str, *, fail_symbol: str | None = None):
+            super().__init__(name)
+            self.fail_symbol = fail_symbol
+            self.positions_value = [
+                position("XAUS", "bid", "1"),
+                position("BTC", "ask", "0.01"),
+            ]
+
+        async def close_position(self, position: Position):
+            self.calls.append(f"close:{position.symbol}")
+            if position.symbol == self.fail_symbol:
+                raise RuntimeError("market closed")
+            return True
+
+    first = CloseClient("first", fail_symbol="XAUS")
+    second = CloseClient("second")
+
+    with pytest.raises(AppError, match=r"first close XAUS: market closed"):
+        await close_all([first, second])
+
+    assert first.calls == [
+        "cancel_all_orders",
+        "close:XAUS",
+        "close:BTC",
+    ]
+    assert second.calls == [
+        "cancel_all_orders",
+        "close:XAUS",
+        "close:BTC",
+    ]
+
+
+async def test_cli_close_still_loads_positions_when_cancel_fails():
+    from strategy.runner import close_all
+
+    class CancelFailClient(Client):
+        async def cancel_all_orders(self):
+            self.calls.append("cancel_all_orders")
+            raise RuntimeError("cancel unavailable")
+
+    client = CancelFailClient("broken-cancel")
+    client.positions_value = [position("BTC", "bid", "0.01")]
+
+    with pytest.raises(AppError, match=r"broken-cancel cancel orders: cancel unavailable"):
+        await close_all([client])
+
+    assert client.calls == ["cancel_all_orders", "close:BTC"]
+
+
+async def test_cli_close_does_not_fail_when_position_is_skipped():
+    from strategy.runner import close_all
+
+    class ClosedMarketClient(Client):
+        async def close_position(self, position: Position):
+            self.calls.append(f"close:{position.symbol}")
+            return False
+
+    client = ClosedMarketClient("closed-market")
+    client.positions_value = [position("BTC", "bid", "0.01")]
+
+    await close_all([client])
+
+    assert client.calls == ["cancel_all_orders", "close:BTC"]
 
 def test_expected_pnl_is_quiet(monkeypatch):
     warning = Mock()

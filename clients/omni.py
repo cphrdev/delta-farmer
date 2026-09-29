@@ -806,7 +806,13 @@ class OmniClient:
         if position.size == 0:
             return True
         signed_qty = -position.size if position.side == "bid" else position.size
-        quote = await self._quote(position.symbol, abs(signed_qty))
+        try:
+            quote = await self._quote(position.symbol, abs(signed_qty))
+        except ApiError as e:
+            message = str(e)
+            if "market_status_refused" in message and '"status":"Closed"' in message:
+                return False
+            raise
         pld = {
             "quote_id": quote.quote_id,
             "side": "sell" if signed_qty < 0 else "buy",

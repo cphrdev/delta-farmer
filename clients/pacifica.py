@@ -389,10 +389,16 @@ class PacificaClient:
         return items
 
     @retry()
-    async def points_total(self):
+    async def _points_total(self):
         msg = self._sign("get_points", {})
         res = await self._call("POST", "/account/points", json=msg)
         return PointsInfo(**res["data"])
+
+    async def points_total(self):
+        try:
+            return await self._points_total()
+        except Exception:
+            return PointsInfo(points=Decimal(0), referral_points=Decimal(0), volume_7d=Decimal(0), last_distribution_points=Decimal(0), points_boost=Decimal(0), rank=0)
 
     async def total_volume(self):
         res = await self._call("GET", f"/portfolio/volume?account={self.keypair.pubkey()}")

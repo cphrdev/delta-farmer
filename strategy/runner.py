@@ -142,11 +142,42 @@ async def print_positions(accs: Sequence[TradingClient]) -> None:
 
 
 async def close_all(clients: Sequence[TradingClient]) -> None:
-    """Cancel all orders and close all positions. Used by the CLI close command."""
+    """Best-effort emergency close used by the CLI ``close`` command.
+
+    A closed market (or one broken account) must not prevent the remaining
+    positions and accounts from being processed.
+    """
+    failures: list[str] = []
     for client in clients:
-        count1 = await client.cancel_all_orders()
-        count2 = await client.close_all_positions()
-        logger.info(f"{client.name}: Canceled {count1} orders, closed {count2} positions")
+        count1 = 0
+        count2 = 0
+        skipped = 0
+        try:
+            count1 = await client.cancel_all_orders()
+        except Exception as e:
+            failures.append(f"{client.name} cancel orders: {e}")
+
+        try:
+            positions = await client.positions()
+        except Exception as e:
+            failures.append(f"{client.name} load positions: {e}")
+            positions = []
+
+        for position in positions:
+            try:
+                if await client.close_position(position):
+                    count2 += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                failures.append(f"{client.name} close {position.symbol}: {e}")
+
+        suffix = f", skipped {skipped} (market closed)" if skipped else ""
+        logger.info(f"{client.name}: Canceled {count1} orders, closed {count2} positions{suffix}")
+
+    if failures:
+        details = "\n".join(f"- {failure}" for failure in failures)
+        raise AppError(f"Close incomplete; some operations failed:\n{details}")
 
 
 # MARK: Groups
