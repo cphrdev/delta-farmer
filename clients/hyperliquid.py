@@ -569,12 +569,14 @@ class HyperLiquidClient:
         return ProfileInfo(addr=addr, balance=bal, volume=volume, pnl=pnl, points=Decimal(0))
 
 
-def warn_legacy_hyperliquid_accounts(accounts: Sequence[str], app_name: str) -> None:
+def warn_legacy_hyperliquid_accounts(
+    accounts: Sequence[str], app_name: str, cli_name: str | None = None
+) -> None:
     if not accounts:
         return
 
     names = ", ".join(accounts)
-    command = f"uv run apps/{app_name.lower()}.py migrate"
+    command = f"uv run apps/{cli_name or app_name.lower()}.py migrate"
     rprint(
         "[cyan]*[/cyan] Hyperliquid Unified Account is recommended; "
         f"other account modes are best-effort and not guaranteed: {names}. "

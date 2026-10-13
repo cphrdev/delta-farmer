@@ -47,6 +47,7 @@ Each exchange has a launcher under `apps/`. Use the launcher name as `<app>` in 
 
 | App        | Exchange                                                          | Wallet | Deposit / withdraw | Extra tools                   |
 | ---------- | ----------------------------------------------------------------- | ------ | ------------------ | ----------------------------- |
+| `entropy`  | [Entropy](https://entropy.io/)                                    | EVM    | —                  | Unified Account migration     |
 | `lighter`  | [Lighter on Robinhood Chain](https://robinhoodchain.lighter.xyz/) | EVM    | Yes                | Referral codes                |
 | `n1`       | [N1](https://app.n1.xyz/r/vladkens)                               | EVM    | —                  | —                             |
 | `nado`     | [Nado](https://app.nado.xyz?join=yUAjz7a)                         | EVM    | —                  | —                             |
@@ -152,7 +153,7 @@ uv run apps/omni.py close
 | `close`                                      | All active launchers                 | Cancel open orders and close all positions on enabled accounts.                  |
 | `positions`                                  | All active launchers                 | Show current positions and risk metrics.                                         |
 | `info`                                       | All active launchers                 | Show balances and exchange-specific account metrics.                             |
-| `stats [FILTER] [-g {week,day}] [--force]`   | All except TradeXYZ                  | Show period statistics and optionally refresh cached history.                    |
+| `stats [FILTER] [-g {week,day}] [--force]`   | All except Entropy and TradeXYZ      | Show period statistics and optionally refresh cached history.                    |
 | `addrs`                                      | All active launchers                 | Show the wallet address derived for every configured account.                    |
 | `login [--force]`                            | All active launchers                 | Check account sessions and retry failed logins; `--force` starts fresh sessions. |
 | `proxy`                                      | All active launchers                 | Check configured proxies, public IPs, and latency.                               |
@@ -161,7 +162,7 @@ uv run apps/omni.py close
 | `withdraw [-a NAME] [--full]`                | Omni and Lighter                     | Withdraw toward configured targets or withdraw the full safe balance.            |
 | `useref CODE [-a NAME]`                      | Lighter                              | Apply a referral code to every enabled account or one selected account.           |
 | `competition`                                | Omni                                 | Show the active competition and offer to join eligible accounts.                 |
-| `migrate`                                    | TradeXYZ                             | Migrate configured wallets to Hyperliquid Unified Account mode.                  |
+| `migrate`                                    | Entropy and TradeXYZ                 | Migrate configured wallets to Hyperliquid Unified Account mode.                  |
 | `clean`                                      | All active launchers                 | Delete locally cached exchange history.                                          |
 | `config new`                                 | All active launchers                 | Create a config from `config.example.toml`.                                      |
 | `config encrypt`                             | All active launchers                 | Encrypt private keys and other supported secrets in place.                       |
@@ -268,6 +269,42 @@ uv run apps/tradexyz.py migrate
 ```
 
 To stop the trading loop gracefully, press `Ctrl+C` once. To cancel open orders and close every Trade.xyz position without starting the loop, run `uv run apps/tradexyz.py close`. Built-in `deposit`, `withdraw`, and `stats` commands are not available for TradeXYZ.
+
+### Entropy
+
+Entropy trading uses the `entropy` launcher and is strictly scoped to Entropy's `io` HIP-3 deployment. It uses Hyperliquid's standard HIP-3 trading API, which Entropy documents as its execution and margining layer. Create a fresh config with `uv run apps/entropy.py config new`, or edit `configs/entropy.toml`:
+
+```toml
+leverage = 10
+symbols = ["SNDK", "NBIS", "IONQ"]
+symbols_per_trade = 1
+use_limit = false
+first_as_prime = false
+
+trade_size_usd = { min = 140, max = 160 }
+trade_duration = { min = "15m", max = "20m" }
+trade_cooldown = { min = "3m", max = "6m" }
+
+[[accounts]]
+name = "acc1"
+privkey = "your-private-key"
+
+[[accounts]]
+name = "acc2"
+privkey = "your-private-key"
+```
+
+Bare symbols are automatically normalized (`SNDK` becomes `io:SNDK`), while symbols from another HIP-3 namespace are rejected before account setup. Verify current listings and leverage limits against [Entropy's asset directory](https://docs.entropy.io/asset-directory/equity-assets).
+
+```bash
+uv run apps/entropy.py config encrypt
+uv run apps/entropy.py info
+uv run apps/entropy.py positions
+uv run apps/entropy.py trade
+uv run apps/entropy.py close
+```
+
+If `info` reports an account mode other than `unifiedAccount`, close active positions and orders before running `uv run apps/entropy.py migrate`. Built-in `deposit`, `withdraw`, and `stats` commands are not available for Entropy.
 
 ### Named pools
 

@@ -2,12 +2,20 @@ from decimal import Decimal
 
 import pytest
 
-from apps.tradexyz import _normalize_symbols
 from clients.tradexyz import TradeXYZClient
+from lib.hip3 import normalize_hip3_symbols
 
 
 def test_normalize_symbols_adds_xyz_namespace():
-    assert _normalize_symbols(["SP500", "xyz:GOLD"]) == ["xyz:SP500", "xyz:GOLD"]
+    assert normalize_hip3_symbols(["SP500", "xyz:GOLD"], "xyz") == [
+        "xyz:SP500",
+        "xyz:GOLD",
+    ]
+
+
+def test_normalize_symbols_rejects_another_namespace():
+    with pytest.raises(ValueError, match="expected xyz: symbol"):
+        normalize_hip3_symbols(["io:SNDK"], "xyz")
 
 
 def test_client_scopes_metadata_to_xyz():
