@@ -53,6 +53,7 @@ Each exchange has a launcher under `apps/`. Use the launcher name as `<app>` in 
 | `omni`     | [Omni](https://omni.variational.io)                               | EVM    | Yes                | Competition status and opt-in |
 | `pacifica` | [Pacifica](https://app.pacifica.fi?referral=uid127)               | Solana | —                  | —                             |
 | `rise`     | [RISE](https://www.rise.trade/)                                   | EVM    | —                  | —                             |
+| `tradexyz` | [Trade.xyz](https://trade.xyz/)                                   | EVM    | —                  | Unified Account migration     |
 
 Delta-farmer previously supported Ethereal and HyENA, but both projects have since closed.
 
@@ -151,7 +152,7 @@ uv run apps/omni.py close
 | `close`                                      | All active launchers                 | Cancel open orders and close all positions on enabled accounts.                  |
 | `positions`                                  | All active launchers                 | Show current positions and risk metrics.                                         |
 | `info`                                       | All active launchers                 | Show balances and exchange-specific account metrics.                             |
-| `stats [FILTER] [-g {week,day}] [--force]`   | All active launchers                 | Show period statistics and optionally refresh cached history.                    |
+| `stats [FILTER] [-g {week,day}] [--force]`   | All except TradeXYZ                  | Show period statistics and optionally refresh cached history.                    |
 | `addrs`                                      | All active launchers                 | Show the wallet address derived for every configured account.                    |
 | `login [--force]`                            | All active launchers                 | Check account sessions and retry failed logins; `--force` starts fresh sessions. |
 | `proxy`                                      | All active launchers                 | Check configured proxies, public IPs, and latency.                               |
@@ -160,6 +161,7 @@ uv run apps/omni.py close
 | `withdraw [-a NAME] [--full]`                | Omni and Lighter                     | Withdraw toward configured targets or withdraw the full safe balance.            |
 | `useref CODE [-a NAME]`                      | Lighter                              | Apply a referral code to every enabled account or one selected account.           |
 | `competition`                                | Omni                                 | Show the active competition and offer to join eligible accounts.                 |
+| `migrate`                                    | TradeXYZ                             | Migrate configured wallets to Hyperliquid Unified Account mode.                  |
 | `clean`                                      | All active launchers                 | Delete locally cached exchange history.                                          |
 | `config new`                                 | All active launchers                 | Create a config from `config.example.toml`.                                      |
 | `config encrypt`                             | All active launchers                 | Encrypt private keys and other supported secrets in place.                       |
@@ -217,6 +219,55 @@ Basket mode trades two to four symbols in the same cycle. Here `symbols_per_trad
 symbols = ["BTC", "ETH"]
 symbols_per_trade = 2
 ```
+
+### Trade.xyz
+
+Trade.xyz trading uses the `tradexyz` launcher and is scoped to the `xyz` HIP-3 markets on Hyperliquid. Create its config with:
+
+```bash
+uv run apps/tradexyz.py config new
+```
+
+Then edit `configs/tradexyz.toml`. A minimal trading config looks like this:
+
+```toml
+leverage = 10
+symbols = ["SP500", "GOLD"]
+symbols_per_trade = 1
+use_limit = false
+first_as_prime = false
+
+trade_size_usd = { min = 140, max = 160 }
+trade_duration = { min = "15m", max = "20m" }
+trade_cooldown = { min = "3m", max = "6m" }
+
+[[accounts]]
+name = "acc1"
+privkey = "your-private-key"
+
+[[accounts]]
+name = "acc2"
+privkey = "your-private-key"
+```
+
+Bare symbols are automatically scoped to Trade.xyz, so `SP500` and `xyz:SP500` are equivalent in this config. Use only markets currently listed by Trade.xyz, and set `leverage` no higher than the lowest maximum supported by every configured market.
+
+Encrypt the config, inspect the accounts, and start trading:
+
+```bash
+uv run apps/tradexyz.py config encrypt
+uv run apps/tradexyz.py info
+uv run apps/tradexyz.py positions
+uv run apps/tradexyz.py trade
+```
+
+TradeXYZ recommends Hyperliquid Unified Account mode. If `info` reports a different mode, close active positions and orders, then migrate the configured accounts:
+
+```bash
+uv run apps/tradexyz.py migrate
+```
+
+To stop the trading loop gracefully, press `Ctrl+C` once. To cancel open orders and close every Trade.xyz position without starting the loop, run `uv run apps/tradexyz.py close`. Built-in `deposit`, `withdraw`, and `stats` commands are not available for TradeXYZ.
 
 ### Named pools
 
