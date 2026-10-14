@@ -23,3 +23,17 @@ async def test_client_rejects_non_io_order():
 
     with pytest.raises(ValueError, match="only trades io: symbols"):
         await client._place_order("xyz:SNDK", "bid", Decimal("1"), Decimal("1"), "Gtc")
+
+
+async def test_volume_sums_entropy_fill_notional(monkeypatch):
+    client = EntropyClient("test", "0x" + "01" * 32)
+
+    async def fills(_since=None):
+        return [
+            {"coin": "io:SNDK", "px": "50", "sz": "2"},
+            {"coin": "io:NBIS", "px": "25.5", "sz": "4"},
+        ]
+
+    monkeypatch.setattr(client, "fetch_fills", fills)
+
+    assert await client.volume() == Decimal("202")

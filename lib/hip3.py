@@ -34,14 +34,15 @@ async def print_hip3_info[H: HyperLiquidClient](
         Column("", justify="left"),
         Column("Account", justify="left"),
         Column("Address", justify="left"),
+        Column("Volume", "{:,.0f}", total=sum),
         Column("Balance", "{:,.2f}", total=sum),
         Column("Mode", justify="left"),
     )
     legacy_accounts: list[str] = []
 
     async def row(acc: H):
-        registered, balance, mode = await asyncio.gather(
-            acc.registered(), acc.balance(), acc.account_mode()
+        registered, volume, balance, mode = await asyncio.gather(
+            acc.registered(), acc.volume(), acc.balance(), acc.account_mode()
         )
         if mode != "unifiedAccount":
             legacy_accounts.append(acc.name)
@@ -49,6 +50,7 @@ async def print_hip3_info[H: HyperLiquidClient](
             "✓" if registered else "✗",
             acc.name,
             short_addr(acc.address),
+            volume if registered else Decimal(0),
             balance if registered else Decimal(0),
             mode,
         )

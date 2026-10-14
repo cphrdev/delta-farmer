@@ -147,6 +147,13 @@ class HyperLiquidClient:
             return [f for f in all_fills if f["coin"].startswith(f"{self.dex_prefix}:")]
         return [f for f in all_fills if ":" not in f["coin"]]
 
+    async def volume(self) -> Decimal:
+        fills = await self.fetch_fills()
+        return sum(
+            (abs(Decimal(str(fill["px"])) * Decimal(str(fill["sz"]))) for fill in fills),
+            Decimal(0),
+        )
+
     def _sign_l1_action(self, action: dict, nonce: int) -> dict:
         data: bytes = msgpack.packb(action, use_bin_type=True)  # type: ignore[assignment]
         data += struct.pack(">Q", nonce)
