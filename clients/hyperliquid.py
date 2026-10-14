@@ -4,7 +4,7 @@ import asyncio
 import struct
 import time
 from collections.abc import Collection, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from math import floor, log10
 from typing import Any, NoReturn, Self
@@ -23,6 +23,7 @@ from lib.models import AccountConfig
 from strategy import Order, OrderBook, OrderStatus, Position, ProfileInfo, Side, TradingClient
 
 HL_API = "https://api.hyperliquid.xyz"
+MIN_SESSION_FUNDING_USD = Decimal("10")
 
 _AGENT_DOMAIN = {
     "name": "Exchange",
@@ -163,10 +164,60 @@ class HyperLiquidClient:
             start_ms = page[-1]["time"] + 1
         return all_fundings
 
+    async def _fetch_ledger_updates(self, since: datetime | None = None) -> list[dict]:
+        """Fetch deposits and transfers used to identify the current funded session."""
+        start_ms = int(since.timestamp() * 1000) if since else 0
+        all_updates: list[dict] = []
+        while True:
+            page: list[dict] = await self._info(
+                type="userNonFundingLedgerUpdates",
+                user=self.address,
+                startTime=start_ms,
+            )
+            all_updates.extend(page)
+            if len(page) < 500:
+                break
+            start_ms = page[-1]["time"] + 1
+        return all_updates
+
+    def _current_funding_start(self, updates: Sequence[dict]) -> datetime | None:
+        """Find the latest material external USDC funding event for this address."""
+        address = self.address.lower()
+        funding_times: list[int] = []
+        for update in updates:
+            delta = update.get("delta", {})
+            kind = delta.get("type")
+            amount = Decimal(str(delta.get("usdc", delta.get("amount", 0))))
+            if amount < MIN_SESSION_FUNDING_USD:
+                continue
+
+            if kind == "deposit":
+                funding_times.append(int(update["time"]))
+                continue
+
+            if kind not in ("send", "internalTransfer", "subAccountTransfer"):
+                continue
+            if str(delta.get("token", "USDC")) != "USDC":
+                continue
+            if str(delta.get("destination", "")).lower() != address:
+                continue
+            if str(delta.get("user", "")).lower() == address:
+                continue
+            funding_times.append(int(update["time"]))
+
+        if not funding_times:
+            return None
+        return datetime.fromtimestamp(max(funding_times) / 1000, tz=UTC)
+
     async def realized_pnl(self, dex_prefixes: Collection[str]) -> Decimal:
-        """Return net realized P/L for the requested HIP-3 DEX namespaces."""
+        """Return net realized P/L for the current funded HIP-3 session."""
         prefixes = tuple(f"{prefix}:" for prefix in dex_prefixes)
-        fills, fundings = await asyncio.gather(self._fetch_fills(), self._fetch_fundings())
+        updates = await self._fetch_ledger_updates()
+        since = self._current_funding_start(updates)
+        fills, fundings = await asyncio.gather(
+            self._fetch_fills(since),
+            self._fetch_fundings(since),
+        )
 
         pnl = sum(
             (
