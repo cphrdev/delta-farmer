@@ -3,7 +3,7 @@
 import asyncio
 import struct
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from decimal import Decimal
 from math import floor, log10
@@ -146,6 +146,46 @@ class HyperLiquidClient:
         if self.dex_prefix:
             return [f for f in all_fills if f["coin"].startswith(f"{self.dex_prefix}:")]
         return [f for f in all_fills if ":" not in f["coin"]]
+
+    async def _fetch_fundings(self, since: datetime | None = None) -> list[dict]:
+        """Fetch funding payments via userFunding (paginated), without a DEX filter."""
+        start_ms = int(since.timestamp() * 1000) if since else 0
+        all_fundings: list[dict] = []
+        while True:
+            page: list[dict] = await self._info(
+                type="userFunding",
+                user=self.address,
+                startTime=start_ms,
+            )
+            all_fundings.extend(page)
+            if len(page) < 500:
+                break
+            start_ms = page[-1]["time"] + 1
+        return all_fundings
+
+    async def realized_pnl(self, dex_prefixes: Collection[str]) -> Decimal:
+        """Return net realized P/L for the requested HIP-3 DEX namespaces."""
+        prefixes = tuple(f"{prefix}:" for prefix in dex_prefixes)
+        fills, fundings = await asyncio.gather(self._fetch_fills(), self._fetch_fundings())
+
+        pnl = sum(
+            (
+                Decimal(str(fill.get("closedPnl", 0)))
+                - Decimal(str(fill.get("fee", 0)))
+                for fill in fills
+                if str(fill.get("coin", "")).startswith(prefixes)
+            ),
+            Decimal(0),
+        )
+        funding = sum(
+            (
+                Decimal(str(item.get("delta", {}).get("usdc", 0)))
+                for item in fundings
+                if str(item.get("delta", {}).get("coin", "")).startswith(prefixes)
+            ),
+            Decimal(0),
+        )
+        return pnl + funding
 
     async def volume(self) -> Decimal:
         fills = await self.fetch_fills()

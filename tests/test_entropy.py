@@ -4,7 +4,6 @@ import pytest
 
 from clients.entropy import EntropyClient
 from lib.hip3 import normalize_hip3_symbols, print_hip3_info
-from strategy import ProfileInfo
 
 
 def test_normalize_symbols_adds_io_namespace():
@@ -63,14 +62,12 @@ async def test_info_shows_total_account_burn(monkeypatch):
     async def volume():
         return Decimal("123")
 
-    async def profile():
-        return ProfileInfo(
-            addr="unused",
-            balance=Decimal("500"),
-            volume=Decimal("999"),
-            pnl=Decimal("-7.5"),
-            points=Decimal(0),
-        )
+    async def realized_pnl(dex_prefixes):
+        assert dex_prefixes == ("xyz", "io")
+        return Decimal("-7.5")
+
+    async def balance():
+        return Decimal("500")
 
     async def account_mode():
         return "unifiedAccount"
@@ -79,7 +76,8 @@ async def test_info_shows_total_account_burn(monkeypatch):
     monkeypatch.setattr("lib.hip3.warn_legacy_hyperliquid_accounts", lambda *_: None)
     monkeypatch.setattr(client, "registered", registered)
     monkeypatch.setattr(client, "volume", volume)
-    monkeypatch.setattr(client, "profile", profile)
+    monkeypatch.setattr(client, "realized_pnl", realized_pnl)
+    monkeypatch.setattr(client, "balance", balance)
     monkeypatch.setattr(client, "account_mode", account_mode)
 
     await print_hip3_info([client], "Entropy", "entropy")
@@ -100,3 +98,28 @@ async def test_info_shows_total_account_burn(monkeypatch):
         Decimal("500"),
         "unifiedAccount",
     )
+
+
+async def test_realized_pnl_combines_xyz_and_io_fills_fees_and_funding(monkeypatch):
+    client = EntropyClient("test", "0x" + "01" * 32)
+
+    async def fills(_since=None):
+        return [
+            {"coin": "xyz:XYZ100", "closedPnl": "-2", "fee": "0.40"},
+            {"coin": "io:SNDK", "closedPnl": "-3", "fee": "0.50"},
+            {"coin": "io:NBIS", "closedPnl": "0", "fee": "0.10"},
+            {"coin": "hyna:ETH", "closedPnl": "-100", "fee": "10"},
+            {"coin": "BTC", "closedPnl": "-100", "fee": "10"},
+        ]
+
+    async def fundings(_since=None):
+        return [
+            {"delta": {"coin": "xyz:XYZ100", "usdc": "-0.25"}},
+            {"delta": {"coin": "io:SNDK", "usdc": "0.10"}},
+            {"delta": {"coin": "hyna:ETH", "usdc": "-20"}},
+        ]
+
+    monkeypatch.setattr(client, "_fetch_fills", fills)
+    monkeypatch.setattr(client, "_fetch_fundings", fundings)
+
+    assert await client.realized_pnl(("xyz", "io")) == Decimal("-6.15")

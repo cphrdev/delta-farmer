@@ -14,6 +14,8 @@ from lib.utils import gather_accs, short_addr
 from strategy import AppConfig
 from strategy.runner import close_all, print_positions, run_strategy
 
+SHARED_BURN_DEX_PREFIXES = ("xyz", "io")
+
 
 def normalize_hip3_symbols(symbols: list[str], dex_prefix: str) -> list[str]:
     result: list[str] = []
@@ -42,8 +44,12 @@ async def print_hip3_info[H: HyperLiquidClient](
     legacy_accounts: list[str] = []
 
     async def row(acc: H):
-        registered, volume, profile, mode = await asyncio.gather(
-            acc.registered(), acc.volume(), acc.profile(), acc.account_mode()
+        registered, volume, pnl, balance, mode = await asyncio.gather(
+            acc.registered(),
+            acc.volume(),
+            acc.realized_pnl(SHARED_BURN_DEX_PREFIXES),
+            acc.balance(),
+            acc.account_mode(),
         )
         if mode != "unifiedAccount":
             legacy_accounts.append(acc.name)
@@ -52,8 +58,8 @@ async def print_hip3_info[H: HyperLiquidClient](
             acc.name,
             short_addr(acc.address),
             volume if registered else Decimal(0),
-            -profile.pnl if registered else Decimal(0),
-            profile.balance if registered else Decimal(0),
+            -pnl if registered else Decimal(0),
+            balance if registered else Decimal(0),
             mode,
         )
 
