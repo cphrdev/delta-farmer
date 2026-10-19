@@ -304,14 +304,20 @@ class OmniClient:
     async def _login(self) -> None:
         await self._prepare_login()
         pld = {"address": self.address}
-        rep = await self._request("POST", "/auth/generate_signing_data", json=pld)
-        if not rep.text.startswith("omni.variational.io wants you to"):
+        rep = await self._request("POST", "/auth/v2/generate_signing_data", json=pld)
+        try:
+            data = rep.json() if rep.ok else None
+        except Exception:
+            data = None
+        message = data.get("message") if isinstance(data, dict) else None
+        nonce = data.get("nonce") if isinstance(data, dict) else None
+        if not message or not nonce:
             raise ApiError("Unexpected signing data", rep)
 
-        msg = encode_defunct(text=rep.text)
+        msg = encode_defunct(text=str(message))
         sig = self.account.sign_message(msg).signature.hex().replace("0x", "")
 
-        pld = {"address": self.address, "signed_message": sig}
+        pld = {"address": self.address, "signed_message": sig, "nonce": nonce}
         rep = await self._request("POST", "/auth/login", json=pld)
         if not rep.ok or "vr-token" not in self.http.session.cookies:
             if rep.status_code == 429:

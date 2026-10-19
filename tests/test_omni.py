@@ -20,6 +20,10 @@ from lib.http import ApiError, AsyncHttp
 from strategy import Position
 
 
+def _signing_data(message="omni.variational.io wants you to sign in", nonce="nonce-1"):
+    return Mock(ok=True, json=Mock(return_value={"message": message, "nonce": nonce}))
+
+
 @pytest.fixture
 def client():
     value = object.__new__(OmniClient)
@@ -75,8 +79,8 @@ async def test_login_authenticates_missing_or_forced_session(client, force):
     client.http.clear_cookies.side_effect = client.http.session.cookies.clear
 
     async def request(_method, path, **_kwargs):
-        if path == "/auth/generate_signing_data":
-            return Mock(text="omni.variational.io wants you to sign in")
+        if path == "/auth/v2/generate_signing_data":
+            return _signing_data()
         client.http.session.cookies["vr-token"] = "new"
         return Mock(ok=True)
 
@@ -99,8 +103,8 @@ async def test_login_reauthenticates_rejected_session(client):
     async def request(_method, path, **_kwargs):
         if path == "/portfolio?compute_margin=true":
             return Mock(ok=False, status_code=401)
-        if path == "/auth/generate_signing_data":
-            return Mock(text="omni.variational.io wants you to sign in")
+        if path == "/auth/v2/generate_signing_data":
+            return _signing_data()
         client.http.session.cookies["vr-token"] = "new"
         return Mock(ok=True)
 
@@ -137,8 +141,8 @@ async def test_login_preparation_does_not_retry_solver_error(client):
 
 async def test_login_reports_cloudflare_rate_limit(client):
     async def request(_method, path, **_kwargs):
-        if path == "/auth/generate_signing_data":
-            return Mock(text="omni.variational.io wants you to sign in")
+        if path == "/auth/v2/generate_signing_data":
+            return _signing_data()
         return Mock(ok=False, status_code=429, text="<html>rate limited</html>")
 
     client._request.side_effect = request
@@ -157,7 +161,7 @@ async def test_login_does_not_rerun_after_failure(client):
 
     assert client._prepare_login.await_count == 1
     assert [call.args[1] for call in client._request.await_args_list] == [
-        "/auth/generate_signing_data"
+        "/auth/v2/generate_signing_data"
     ]
 
 
@@ -172,8 +176,8 @@ async def test_login_restarts_with_fresh_signing_data_after_rejected_login(clien
 
     async def request(_method, path, **_kwargs):
         paths.append(path)
-        if path == "/auth/generate_signing_data":
-            return Mock(text=next(signing_data))
+        if path == "/auth/v2/generate_signing_data":
+            return _signing_data(next(signing_data), nonce=f"nonce-{paths.count(path)}")
         if paths.count("/auth/login") == 1:
             return Mock(ok=False, status_code=400, text="signature expired")
         client.http.session.cookies["vr-token"] = "new"
@@ -184,12 +188,15 @@ async def test_login_restarts_with_fresh_signing_data_after_rejected_login(clien
     await client.login()
 
     assert paths == [
-        "/auth/generate_signing_data",
+        "/auth/v2/generate_signing_data",
         "/auth/login",
-        "/auth/generate_signing_data",
+        "/auth/v2/generate_signing_data",
         "/auth/login",
     ]
     assert client.account.sign_message.call_count == 2
+    login = client._request.await_args_list[1]
+    assert login.kwargs["json"]["nonce"] == "nonce-1"
+    assert login.kwargs["json"]["signed_message"] == "736967"
 
 
 def test_400_cloudflare_html_is_detected_as_challenge():
@@ -463,9 +470,9 @@ async def test_concurrent_unauthorized_calls_share_one_authentication(client):
                 await both_requests_started.wait()
                 return unauthorized
             return success
-        if path == "/auth/generate_signing_data":
+        if path == "/auth/v2/generate_signing_data":
             login_requests += 1
-            return Mock(text="omni.variational.io wants you to sign in")
+            return _signing_data()
         if path == "/auth/login":
             login_requests += 1
             client.http.session.cookies["vr-token"] = "new"

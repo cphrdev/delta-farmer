@@ -90,6 +90,37 @@ async def test_enabled_accounts(monkeypatch):
     assert not any("supporter" in call.args[0] for call in eprint.call_args_list)
 
 
+async def test_login_uses_enabled_accounts_only(monkeypatch):
+    accounts = [
+        AccountConfig(name="on", privkey="x", enabled=True),
+        AccountConfig(name="off", privkey="x", enabled=False),
+    ]
+    check = AsyncMock(
+        return_value={"state": "none", "account_count": 1, "license": None, "offline": False}
+    )
+    logged = []
+
+    async def handle_login(clients, *, force):
+        logged.extend(client.name for client in clients)
+
+    monkeypatch.setattr("lib.cli.support.check", check)
+    monkeypatch.setattr("lib.cli.eprint", Mock())
+    monkeypatch.setattr("lib.cli.latest_release_notice", AsyncMock(return_value=None))
+    monkeypatch.setattr("lib.cli._handle_login", handle_login)
+    monkeypatch.setattr("lib.cli.sys.exit", Mock(side_effect=SystemExit))
+    monkeypatch.setenv("DF_NO_BANNER", "1")
+
+    cfg = Mock(accounts=accounts)
+    with pytest.raises(SystemExit):
+        await setup_app(
+            argparse.Namespace(command="login", force=False),
+            cfg,
+            lambda account: Client(account.name),
+        )
+
+    assert logged == ["on"]
+
+
 async def test_supporter_can_hide_banner_with_env(monkeypatch):
     license = {
         "plan": "small",

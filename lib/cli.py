@@ -246,7 +246,7 @@ async def setup_app[T: CliClient](
     await _show_banner(status)
 
     if args.command == "login":
-        await _handle_login(all_clients, force=args.force)
+        await _handle_login(active_clients, force=args.force)
         sys.exit(0)
 
     if args.command == "addrs":
