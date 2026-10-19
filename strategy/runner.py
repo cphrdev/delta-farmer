@@ -18,7 +18,7 @@ from lib.logger import logger
 
 from .cycle import DeltaStrategy
 from .models import AppConfig, Position, TradeConfig, TradingClient
-from .symbols import ensure_exchange_symbols
+from .symbols import ensure_listed_symbols
 
 
 def _env_enabled(name: str) -> bool:
@@ -184,18 +184,15 @@ async def close_all(clients: Sequence[TradingClient]) -> None:
 
 
 async def _check_accounts(accs: Sequence[TradingClient]) -> None:
-    rs = await asyncio.gather(*[a.registered() for a in accs], return_exceptions=True)
-    failed = [a.name for a, r in zip(accs, rs) if isinstance(r, Exception) or r is False]
+    acc_list = list(accs)
+    rs = await utils.gather_accs(acc_list, lambda acc: acc.registered())
+    failed = [acc.name for acc, registered in zip(acc_list, rs) if not registered]
     if failed:
         raise AppError(f"Not registered: {', '.join(failed)}")
 
 
 async def _check_symbols(cfg: TradeConfig, accs: Sequence[TradingClient]) -> None:
-    async def symbol_exists(acc: TradingClient, symbol: str) -> bool:
-        await acc.get_lot_size(symbol)
-        return True
-
-    await ensure_exchange_symbols(accs, cfg.symbols, symbol_exists)
+    await ensure_listed_symbols(accs, cfg.symbols)
 
 
 async def _run_group(
@@ -243,8 +240,9 @@ def _check_cfg(cfg: TradeConfig, accs: Sequence[TradingClient]):
 
 
 async def _balance_sorted(accs: Sequence[TradingClient]) -> list[TradingClient]:
-    rs = await asyncio.gather(*[a.balance() for a in accs])
-    pairs = [(acc, bal) for acc, bal in zip(accs, rs)]
+    acc_list = list(accs)
+    rs = await utils.gather_accs(acc_list, lambda acc: acc.balance())
+    pairs = list(zip(acc_list, rs))
     pairs.sort(key=lambda x: x[1])
     return [acc for acc, _ in pairs]
 

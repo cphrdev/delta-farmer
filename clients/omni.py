@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Self
 
 from eth_account.messages import encode_defunct, encode_typed_data
-from pydantic import AliasPath, BaseModel, ConfigDict, Field
+from pydantic import AliasPath, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from lib import utils
 from lib.decorators import bind_log_context, locked, retry, retry_on, ttl_cache
@@ -65,7 +65,19 @@ _POINTS_GENESIS = datetime(2025, 12, 17 - 6, tzinfo=UTC)
 
 
 class CloudflareClearanceUpdated(Exception):
-    """Cloudflare clearance was refreshed instead of replaying a request."""
+    """Login must be restarted with fresh signing data after clearance."""
+
+
+def _is_cloudflare_challenge(rep) -> bool:
+    if getattr(rep, "ok", False):
+        return False
+    text = getattr(rep, "text", "") or ""
+    return ">Just a moment...<" in text or "/cdn-cgi/challenge-platform/" in text
+
+
+def _is_managed_challenge(rep) -> bool:
+    text = getattr(rep, "text", "") or ""
+    return "cType: 'managed'" in text
 
 
 def _volume_field_total(value: Any) -> Decimal:
@@ -81,7 +93,20 @@ class IndicativeQuote(BaseModel):
     bid: Decimal
     ask: Decimal
     qty: Decimal
-    qty_tick: Decimal = Field(validation_alias=AliasPath("qty_limits", "bid", "min_qty_tick"))
+    qty_tick: Decimal
+
+    @model_validator(mode="before")
+    @classmethod
+    def _qty_tick_from_limits(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or data.get("qty_tick") is not None:
+            return data
+        limits = data.get("qty_limits") or {}
+        bid = limits.get("bid") or {}
+        ask = limits.get("ask") or {}
+        tick = bid.get("min_qty_tick") or ask.get("min_qty_tick")
+        if tick is None:
+            return data
+        return {**data, "qty_tick": tick}
 
 
 class PointsInfo(BaseModel):
@@ -93,12 +118,26 @@ class OmniProfileInfo(ProfileInfo):
     referral_boost: Decimal = Decimal(0)
 
 
+class OmniTradingSchedule(BaseModel):
+    next_open_at: datetime | None = None
+    next_close_at: datetime | None = None
+
+
+class OmniTradingSession(BaseModel):
+    open: datetime
+    close: datetime
+
+
 class OmniSupportedAsset(BaseModel):
     asset: str
     has_perp: bool = False
     instrument_type: str | None = None
     asset_class: str | None = None
     is_close_only_mode: bool = False
+    funding_interval_s: int | None = None
+    market_status: str | None = None
+    trading_schedule: OmniTradingSchedule | None = None
+    trading_sessions: list[OmniTradingSession] = Field(default_factory=list)
 
 
 class OmniOrder(BaseModel):
@@ -217,34 +256,35 @@ class OmniClient:
             proxy=proxy,
             cookies_file=f".cache/omni_{utils.short_addr(self.address)}_http.pkl",
         )
+        self._login_error: BaseException | None = None
 
-    async def _request(
-        self, method: HttpMethod, url: str, *, replay_after_cf: bool = True, **kwargs
-    ):
-        rep = await self.http.request(method, url, **kwargs)
-        is_cf_challenge = rep.status_code in {403, 429, 503} and (
-            ">Just a moment...<" in rep.text or "/cdn-cgi/challenge-platform/" in rep.text
-        )
-        if not is_cf_challenge:
-            return rep
-
+    async def _solve_cloudflare(self, method: HttpMethod, url: str, last, *, prefer_managed: bool):
         target_url = (
             url if url.startswith(("http://", "https://")) else f"{API_URL}/{url.lstrip('/')}"
         )
-        if "cType: 'managed'" in rep.text:
+        use_managed = prefer_managed or method.upper() == "POST" or _is_managed_challenge(last)
+        if use_managed:
             logger.debug(f"Cloudflare Managed Challenge {method}; requesting cf_clearance: {url}")
             await solve_managed_cf_clearance(self.http, target_url, proxy=self.proxy)
-        else:
-            logger.debug(f"Cloudflare JSD challenged {method}; refreshing cf_clearance: {url}")
-            if not await ensure_cf_clearance(self.http, target_url, force=True):
-                return rep
+            return True
+        logger.debug(f"Cloudflare JSD challenged {method}; refreshing cf_clearance: {url}")
+        if await ensure_cf_clearance(self.http, target_url, force=True):
+            return False
+        logger.debug(f"Cloudflare JSD params missing; escalating to managed: {url}")
+        await solve_managed_cf_clearance(self.http, target_url, proxy=self.proxy)
+        return True
 
-        if not replay_after_cf:
-            raise CloudflareClearanceUpdated(
-                "Cloudflare clearance ready; restarting login with fresh signing data"
+    async def _request(self, method: HttpMethod, url: str, **kwargs):
+        last = await self.http.request(method, url, **kwargs)
+        used_managed = False
+        for _ in range(2):
+            if not _is_cloudflare_challenge(last):
+                return last
+            used_managed = await self._solve_cloudflare(
+                method, url, last, prefer_managed=used_managed
             )
-
-        return await self.http.request(method, url, **kwargs)
+            last = await self.http.request(method, url, **kwargs)
+        return last
 
     async def _prepare_login(self) -> None:
         rep = await self._request("GET", f"{APP_URL}/portfolio?tab=positions")  # app access
@@ -260,7 +300,7 @@ class OmniClient:
         res = rep.json()
         return res["settlement_pool"] is not None
 
-    @retry_on(CloudflareClearanceUpdated, retries=1)
+    @retry_on(CloudflareClearanceUpdated, retries=2)
     async def _login(self) -> None:
         await self._prepare_login()
         pld = {"address": self.address}
@@ -272,8 +312,18 @@ class OmniClient:
         sig = self.account.sign_message(msg).signature.hex().replace("0x", "")
 
         pld = {"address": self.address, "signed_message": sig}
-        rep = await self._request("POST", "/auth/login", json=pld, replay_after_cf=False)
+        rep = await self._request("POST", "/auth/login", json=pld)
         if not rep.ok or "vr-token" not in self.http.session.cookies:
+            if rep.status_code == 429:
+                raise ApiError(
+                    "Login blocked by Cloudflare (429). This proxy is rate-limited or "
+                    "cf_clearance was rejected; wait or use a sticky session on the same IP",
+                    rep,
+                )
+            if rep.status_code in {400, 401} and not _is_cloudflare_challenge(rep):
+                raise CloudflareClearanceUpdated(
+                    "Login rejected after clearance; restarting with fresh signing data"
+                )
             raise ApiError("Login failed", rep)
 
     def _clear_auth(self) -> None:
@@ -292,10 +342,18 @@ class OmniClient:
 
     @locked
     async def login(self, *, force: bool = False) -> None:
-        self.http.clear_cookies() if force else None
+        if force:
+            self._login_error = None
+            self.http.clear_cookies()
+        elif self._login_error is not None:
+            raise self._login_error
         if force or not await self._check_auth():
             self._clear_auth()
-            await self._login()
+            try:
+                await self._login()
+            except Exception as e:
+                self._login_error = e
+                raise
 
     async def _call(self, method: HttpMethod, path: str, **kwargs):
         self.http.load_cookies()
@@ -430,7 +488,6 @@ class OmniClient:
             "POST",
             "/on_chain/permit",
             json=pld,
-            replay_after_cf=False,
             retry=False,
         )
         if res is not True:
@@ -457,7 +514,6 @@ class OmniClient:
             "POST",
             "/transfers/insert_pending_transfer",
             json=pld,
-            replay_after_cf=False,
             retry=False,
         )
         transfer_id = res.get("id") if isinstance(res, dict) else None
@@ -567,12 +623,23 @@ class OmniClient:
     @ttl_cache(600)
     async def supported_assets(self) -> dict[str, OmniSupportedAsset]:
         res = await self._call("GET", "/metadata/supported_assets")
+        if not isinstance(res, dict):
+            raise ApiError(f"Unexpected supported_assets payload: {type(res).__name__}")
         items: dict[str, OmniSupportedAsset] = {}
         for asset, variants in res.items():
             if not variants:
                 continue
-            item = OmniSupportedAsset(**variants[0])
-            items[asset] = item
+            parsed: OmniSupportedAsset | None = None
+            for variant in variants:
+                try:
+                    parsed = OmniSupportedAsset.model_validate(variant)
+                    break
+                except ValidationError:
+                    continue
+            if parsed is None:
+                logger.warning(f"Skipping unsupported asset metadata: {asset}")
+                continue
+            items[asset] = parsed
         return items
 
     async def _instrument(self, symbol: str) -> dict[str, Any]:
@@ -587,9 +654,13 @@ class OmniClient:
             "instrument_type": instrument_type,
         }
         if instrument_type == "swap":
-            instrument["funding_interval_s"] = 0
+            instrument["funding_interval_s"] = (
+                0 if asset is None or asset.funding_interval_s is None else asset.funding_interval_s
+            )
         elif instrument_type == "perpetual_future":
-            instrument["funding_interval_s"] = 3600
+            instrument["funding_interval_s"] = (
+                3600 if asset is None or asset.funding_interval_s is None else asset.funding_interval_s
+            )
         if asset and asset.asset_class:
             instrument["kind"] = asset.asset_class
         return instrument
@@ -603,7 +674,25 @@ class OmniClient:
         asset = assets.get(symbol)
         if asset is None or not asset.has_perp:
             return False
-        return reduce_only or not asset.is_close_only_mode
+        if not reduce_only and asset.is_close_only_mode:
+            return False
+        at_utc = at.astimezone(UTC) if at.tzinfo else at.replace(tzinfo=UTC)
+        if asset.trading_sessions:
+            if any(session.open <= at_utc < session.close for session in asset.trading_sessions):
+                return True
+            last_close = max(session.close for session in asset.trading_sessions)
+            if at_utc < last_close:
+                return False
+        schedule = asset.trading_schedule
+        if schedule is None:
+            return (asset.market_status or "open").lower() != "closed"
+        is_open = (asset.market_status or "").lower() == "open"
+        next_close, next_open = schedule.next_close_at, schedule.next_open_at
+        if is_open:
+            return next_close is None or at_utc < next_close
+        return (next_open is None or at_utc >= next_open) and (
+            next_close is None or at_utc < next_close
+        )
 
     async def _quote(self, asset: str, qty: Decimal | int | float) -> IndicativeQuote:
         pld = {
@@ -611,7 +700,10 @@ class OmniClient:
             "qty": str(qty),
         }
         res = await self._call("POST", "/quotes/indicative", json=pld)
-        return IndicativeQuote(**res)
+        try:
+            return IndicativeQuote(**res)
+        except ValidationError as e:
+            raise ApiError(f"Unexpected quote shape: {e}") from e
 
     async def get_bbo(self, symbol: str) -> tuple[Decimal, Decimal]:
         q = await self._quote(symbol, 1)

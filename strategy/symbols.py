@@ -35,16 +35,48 @@ async def _run_exchange_symbols[T](
     return results
 
 
+async def ensure_listed_symbols(
+    accs: Sequence[TradingClient],
+    symbols: Sequence[str],
+) -> None:
+    unique_symbols = list(dict.fromkeys(symbols))
+    clients = _unique_exchange_clients(accs)
+    values = await asyncio.gather(
+        *[acc.get_symbols() for acc in clients],
+        return_exceptions=True,
+    )
+    missing: set[tuple[str, str]] = set()
+    for acc, value in zip(clients, values, strict=True):
+        if isinstance(value, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            raise value
+        if isinstance(value, Exception):
+            raise AppError(
+                f"Failed to check symbols on {acc.exchange}: {type(value).__name__}: {value}"
+            ) from value
+        listed = set(value)
+        missing.update(
+            (acc.exchange, symbol) for symbol in unique_symbols if symbol not in listed
+        )
+    if missing:
+        details = "; ".join(
+            f"{symbol} is not available on {exchange}" for exchange, symbol in sorted(missing)
+        )
+        raise AppError(f"Invalid configured symbols: {details}")
+
+
 async def ensure_exchange_symbols(
     accs: Sequence[TradingClient],
     symbols: Sequence[str],
     predicate: Callable[[TradingClient, str], Awaitable[bool]],
 ) -> None:
     results = await _run_exchange_symbols(accs, symbols, predicate)
+    for acc, symbol, value in results:
+        if isinstance(value, Exception):
+            raise AppError(
+                f"Failed to check {symbol} on {acc.exchange}: {type(value).__name__}: {value}"
+            ) from value
     failed = {
-        (acc.exchange, symbol)
-        for acc, symbol, value in results
-        if isinstance(value, Exception) or value is not True
+        (acc.exchange, symbol) for acc, symbol, value in results if value is not True
     }
     if failed:
         details = "; ".join(
@@ -60,9 +92,11 @@ async def filter_exchange_symbols(
 ) -> list[str]:
     unique_symbols = list(dict.fromkeys(symbols))
     results = await _run_exchange_symbols(accs, unique_symbols, predicate)
-    for _acc, _symbol, value in results:
+    for acc, symbol, value in results:
         if isinstance(value, Exception):
-            raise value
+            raise AppError(
+                f"Failed to check {symbol} on {acc.exchange}: {type(value).__name__}: {value}"
+            ) from value
 
     failed = {symbol for _acc, symbol, value in results if value is not True}
     return [symbol for symbol in unique_symbols if symbol not in failed]

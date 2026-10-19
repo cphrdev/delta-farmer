@@ -298,7 +298,7 @@ class DeltaStrategy:
 
     @retry(max_attempts=3, delay=2.0)
     async def get_balances(self, accs: list[TradingClient]) -> Balances:
-        vals = await asyncio.gather(*[acc.balance() for acc in accs])
+        vals = await utils.gather_accs(accs, lambda acc: acc.balance())
         return Balances({acc.name: float(v) for acc, v in zip(accs, vals)})
 
     def get_trade_size(self, bals: Balances) -> Decimal:

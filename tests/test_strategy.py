@@ -381,11 +381,11 @@ async def test_symbols_once_per_exchange():
         def __init__(self, name: str, exchange: str):
             super().__init__(name)
             self.exchange = exchange
-            self.symbols: list[str] = []
+            self.lookups: list[str] = []
 
-        async def get_lot_size(self, symbol: str) -> Decimal:
-            self.symbols.append(symbol)
-            return Decimal("0.001")
+        async def get_symbols(self) -> list[str]:
+            self.lookups.append("symbols")
+            return ["BTC", "ETH"]
 
     first = CountingClient("first", "one")
     duplicate = CountingClient("duplicate", "one")
@@ -393,25 +393,41 @@ async def test_symbols_once_per_exchange():
 
     await _check_symbols(make_cfg(symbols=["BTC", "ETH", "BTC"]), [first, duplicate, second])
 
-    assert first.symbols == ["BTC", "ETH"]
-    assert duplicate.symbols == []
-    assert second.symbols == ["BTC", "ETH"]
+    assert first.lookups == ["symbols"]
+    assert duplicate.lookups == []
+    assert second.lookups == ["symbols"]
 
 
 async def test_symbols_reject_exchange():
-    class FailingClient(Client):
+    class ListedClient(Client):
+        exchange = "first"
+
+        async def get_symbols(self) -> list[str]:
+            return ["BTC", "ETH"]
+
+    class MissingEthClient(Client):
         exchange = "second"
 
-        async def get_lot_size(self, symbol: str) -> Decimal:
-            if symbol == "ETH":
-                raise RuntimeError("missing")
+        async def get_symbols(self) -> list[str]:
+            return ["BTC"]
 
-            return Decimal("0.001")
-
-    clients = [Client("first"), FailingClient("second")]
+    clients = [ListedClient("first"), MissingEthClient("second")]
 
     with pytest.raises(AppError, match="ETH is not available on second"):
         await _check_symbols(make_cfg(symbols=["BTC", "ETH"]), clients)
+
+
+async def test_symbols_surface_exchange_errors():
+    class FailingClient(Client):
+        exchange = "second"
+
+        async def get_symbols(self) -> list[str]:
+            raise RuntimeError("auth failed")
+
+    with pytest.raises(
+        AppError, match="Failed to check symbols on second: RuntimeError: auth failed"
+    ):
+        await _check_symbols(make_cfg(symbols=["BTC"]), [FailingClient("second")])
 
 
 def test_cfg_symbol_count():

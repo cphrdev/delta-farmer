@@ -71,10 +71,51 @@ def _origin_from_url(raw: str) -> str:
 
 
 def _find_cookie(http: AsyncHttp, name: str) -> str | None:
-    for cookie in http.session.cookies.jar:
+    cookies = http.session.cookies
+    getter = getattr(cookies, "get", None)
+    if callable(getter):
+        value = getter(name)
+        if value:
+            return value
+    jar = getattr(cookies, "jar", None)
+    if jar is None:
+        return None
+    for cookie in jar:
         if cookie.name == name:
             return cookie.value
     return None
+
+
+def _cookie_value(raw: str, name: str) -> str:
+    value = raw.strip()
+    prefix = f"{name}="
+    if value.startswith(prefix):
+        value = value[len(prefix) :]
+    return value.split(";", 1)[0].strip()
+
+
+def _set_host_cookie(http: AsyncHttp, host: str, name: str, value: str) -> None:
+    http.session.cookies.set(name, value, domain=host, path="/", secure=True)
+
+
+def _apply_managed_solution(http: AsyncHttp, target_url: str, res: dict) -> None:
+    host = urlparse(target_url).hostname
+    if not host:
+        raise RuntimeError(f"Invalid Cloudflare target URL: {target_url}")
+
+    cookies = get_or(res, "solution.cookies") or {}
+    token = get_or(res, "solution.token")
+    if isinstance(cookies, dict):
+        token = token or cookies.get("cf_clearance")
+        for name, value in cookies.items():
+            _set_host_cookie(http, host, name, _cookie_value(str(value), name))
+    if token:
+        _set_host_cookie(http, host, "cf_clearance", _cookie_value(str(token), "cf_clearance"))
+
+    ua = get_or(res, "solution.userAgent") or get_or(res, "solution.user_agent")
+    headers = getattr(http.session, "headers", None)
+    if ua and headers is not None:
+        headers["User-Agent"] = ua
 
 
 def _parse_challenge_params(html: str) -> _ChallengeParams:
@@ -350,9 +391,10 @@ async def solve_managed_cf_clearance(
     # while the shared gateway uses one key for all requests, so serialize the full
     # create/poll flow within this process.
     async with _MANAGED_CF_LOCK, AsyncSession(timeout=(10, 60)) as session:
+        origin = _origin_from_url(target_url)
         task = {
             "type": "cf_clearance",
-            "websiteURL": target_url,
+            "websiteURL": origin,
             "proxyURL": proxy_url,
             "userAgent": USER_AGENT,
         }
@@ -404,12 +446,11 @@ async def solve_managed_cf_clearance(
                 continue
 
             if status == "closed":
-                if not token:
+                if not token and not get_or(res, "solution.cookies.cf_clearance"):
                     raise RuntimeError("Cloudflare task closed without cf_clearance")
-                host = urlparse(target_url).hostname
-                if not host:
-                    raise RuntimeError(f"Invalid Cloudflare target URL: {target_url}")
-                http.session.cookies.set("cf_clearance", token, domain=host, path="/")
+                _apply_managed_solution(http, origin, res)
+                if not _find_cookie(http, "cf_clearance"):
+                    raise RuntimeError("Cloudflare task closed without cf_clearance")
                 logger.debug(f"Cloudflare task {task_id} solved")
                 return
 

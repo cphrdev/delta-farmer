@@ -1,12 +1,21 @@
 # delta-farmer | https://github.com/vladkens/delta-farmer
 # Copyright (c) vladkens | MIT License | No AI was harmed making this
 import asyncio
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from clients.omni import CloudflareClearanceUpdated, OmniClient, OmniSupportedAsset
+from clients.omni import (
+    CloudflareClearanceUpdated,
+    IndicativeQuote,
+    OmniClient,
+    OmniSupportedAsset,
+    OmniTradingSchedule,
+    OmniTradingSession,
+    _is_cloudflare_challenge,
+)
 from lib.http import ApiError, AsyncHttp
 from strategy import Position
 
@@ -20,6 +29,7 @@ def client():
     value.account.sign_message.return_value.signature = b"sig"
     value.http = Mock()
     value.http.session.cookies = {}
+    value._login_error = None
     value._prepare_login = AsyncMock()
     value._request = AsyncMock()
     return value
@@ -125,7 +135,33 @@ async def test_login_preparation_does_not_retry_solver_error(client):
     client._request.assert_awaited_once()
 
 
-async def test_login_restarts_with_fresh_signing_data_after_clearance(client):
+async def test_login_reports_cloudflare_rate_limit(client):
+    async def request(_method, path, **_kwargs):
+        if path == "/auth/generate_signing_data":
+            return Mock(text="omni.variational.io wants you to sign in")
+        return Mock(ok=False, status_code=429, text="<html>rate limited</html>")
+
+    client._request.side_effect = request
+
+    with pytest.raises(ApiError, match="Login blocked by Cloudflare \\(429\\)"):
+        await client.login()
+
+
+async def test_login_does_not_rerun_after_failure(client):
+    client._request.side_effect = ApiError("Login failed")
+
+    with pytest.raises(ApiError, match="Login failed"):
+        await client.login()
+    with pytest.raises(ApiError, match="Login failed"):
+        await client.login()
+
+    assert client._prepare_login.await_count == 1
+    assert [call.args[1] for call in client._request.await_args_list] == [
+        "/auth/generate_signing_data"
+    ]
+
+
+async def test_login_restarts_with_fresh_signing_data_after_rejected_login(client):
     paths = []
     signing_data = iter(
         [
@@ -134,15 +170,14 @@ async def test_login_restarts_with_fresh_signing_data_after_clearance(client):
         ]
     )
 
-    async def request(_method, path, **kwargs):
+    async def request(_method, path, **_kwargs):
         paths.append(path)
         if path == "/auth/generate_signing_data":
             return Mock(text=next(signing_data))
         if paths.count("/auth/login") == 1:
-            raise CloudflareClearanceUpdated
-        assert kwargs["replay_after_cf"] is False
+            return Mock(ok=False, status_code=400, text="signature expired")
         client.http.session.cookies["vr-token"] = "new"
-        return Mock(ok=True)
+        return Mock(ok=True, status_code=200)
 
     client._request.side_effect = request
 
@@ -155,6 +190,86 @@ async def test_login_restarts_with_fresh_signing_data_after_clearance(client):
         "/auth/login",
     ]
     assert client.account.sign_message.call_count == 2
+
+
+def test_400_cloudflare_html_is_detected_as_challenge():
+    rep = Mock(ok=False, status_code=400, text=">Just a moment...< /cdn-cgi/challenge-platform/")
+    assert _is_cloudflare_challenge(rep)
+
+
+async def test_login_post_uses_managed_solver_for_jsd_html(monkeypatch):
+    client = object.__new__(OmniClient)
+    client.name = "test"
+    client.proxy = "http://user:pass@proxy.example:8080"
+    client.http = Mock()
+    jsd = Mock(
+        ok=False,
+        status_code=403,
+        text=">Just a moment...< /cdn-cgi/challenge-platform/scripts/jsd/",
+    )
+    success = Mock(ok=True, status_code=200, text="ok")
+    client.http.request = AsyncMock(side_effect=[jsd, success])
+    solve = AsyncMock()
+    jsd_solve = AsyncMock()
+    monkeypatch.setattr("clients.omni.solve_managed_cf_clearance", solve)
+    monkeypatch.setattr("clients.omni.ensure_cf_clearance", jsd_solve)
+
+    rep = await OmniClient._request(client, "POST", "/auth/login")
+
+    assert rep is success
+    solve.assert_awaited_once()
+    jsd_solve.assert_not_awaited()
+
+
+async def test_request_does_not_overwrite_managed_clearance_with_jsd(monkeypatch):
+    client = object.__new__(OmniClient)
+    client.name = "test"
+    client.proxy = "http://user:pass@proxy.example:8080"
+    client.http = Mock()
+    managed = Mock(
+        ok=False,
+        status_code=403,
+        text=">Just a moment...< cType: 'managed' /cdn-cgi/challenge-platform/",
+    )
+    jsd = Mock(
+        ok=False,
+        status_code=403,
+        text=">Just a moment...< /cdn-cgi/challenge-platform/scripts/jsd/",
+    )
+    success = Mock(ok=True, status_code=200, text="ok")
+    client.http.request = AsyncMock(side_effect=[managed, jsd, success])
+    solve = AsyncMock()
+    jsd_solve = AsyncMock()
+    monkeypatch.setattr("clients.omni.solve_managed_cf_clearance", solve)
+    monkeypatch.setattr("clients.omni.ensure_cf_clearance", jsd_solve)
+
+    rep = await OmniClient._request(client, "POST", "/auth/login")
+
+    assert rep is success
+    assert solve.await_count == 2
+    jsd_solve.assert_not_awaited()
+
+
+async def test_request_replays_login_after_managed_challenge(monkeypatch):
+    client = object.__new__(OmniClient)
+    client.name = "test"
+    client.proxy = "http://user:pass@proxy.example:8080"
+    client.http = Mock()
+    challenge = Mock(
+        ok=False,
+        status_code=400,
+        text=">Just a moment...< cType: 'managed' /cdn-cgi/challenge-platform/",
+    )
+    success = Mock(ok=True, status_code=200, text="ok")
+    client.http.request = AsyncMock(side_effect=[challenge, success])
+    solve = AsyncMock()
+    monkeypatch.setattr("clients.omni.solve_managed_cf_clearance", solve)
+
+    rep = await OmniClient._request(client, "POST", "/auth/login")
+
+    assert rep is success
+    solve.assert_awaited_once()
+    assert client.http.request.await_count == 2
 
 
 async def test_call_relogs_only_once(client):
@@ -251,6 +366,71 @@ async def test_instrument_uses_supported_asset_metadata(client, asset, expected)
     client.supported_assets = AsyncMock(return_value={asset.asset: asset})
 
     assert await client._instrument(asset.asset) == expected
+
+
+def test_indicative_quote_reads_qty_tick_from_ask_limits():
+    quote = IndicativeQuote.model_validate(
+        {
+            "quote_id": "q1",
+            "mark_price": "100",
+            "index_price": "100",
+            "bid": "99",
+            "ask": "101",
+            "qty": "1",
+            "qty_limits": {"ask": {"min_qty_tick": "0.01"}},
+        }
+    )
+    assert quote.qty_tick == Decimal("0.01")
+
+
+async def test_supported_assets_skips_invalid_variants(client):
+    client._call = AsyncMock(
+        return_value={
+            "BAD": [{"asset": "BAD", "trading_sessions": [{"open": "nope", "close": "nope"}]}],
+            "XAUS": [{"asset": "XAUS", "has_perp": True, "instrument_type": "swap"}],
+        }
+    )
+
+    assets = await client.supported_assets()
+
+    assert list(assets) == ["XAUS"]
+    assert assets["XAUS"].has_perp
+
+
+async def test_swap_symbols_are_listed_without_quoting(client):
+    client.supported_assets = AsyncMock(
+        return_value={
+            "XAUS": OmniSupportedAsset(asset="XAUS", has_perp=True, instrument_type="swap"),
+            "US100S": OmniSupportedAsset(asset="US100S", has_perp=True, instrument_type="swap"),
+        }
+    )
+
+    assert await client.get_symbols() == ["XAUS", "US100S"]
+
+
+async def test_is_symbol_tradeable_uses_swap_sessions(client):
+    session = OmniTradingSession(
+        open=datetime(2026, 10, 18, 22, tzinfo=UTC),
+        close=datetime(2026, 10, 19, 21, tzinfo=UTC),
+    )
+    client.supported_assets = AsyncMock(
+        return_value={
+            "XAUS": OmniSupportedAsset(
+                asset="XAUS",
+                has_perp=True,
+                instrument_type="swap",
+                market_status="open",
+                trading_sessions=[session],
+                trading_schedule=OmniTradingSchedule(
+                    next_open_at=datetime(2026, 10, 19, 22, tzinfo=UTC),
+                    next_close_at=datetime(2026, 10, 19, 21, tzinfo=UTC),
+                ),
+            )
+        }
+    )
+
+    assert await client.is_symbol_tradeable("XAUS", datetime(2026, 10, 18, 22, 42, tzinfo=UTC))
+    assert not await client.is_symbol_tradeable("XAUS", datetime(2026, 10, 18, 21, tzinfo=UTC))
 
 
 async def test_instrument_defaults_unknown_symbol_to_crypto_perp(client):
