@@ -243,6 +243,41 @@ async def test_regular_hours_window_is_enforced():
 
 
 @pytest.mark.asyncio
+async def test_hours_are_market_local_not_utc():
+    """SPY-USD reports 14400-72000 with timezone America/New_York (04:00-20:00 ET).
+    Reading those seconds as UTC closes the market eight hours early."""
+    mkt = market()
+    mkt.regularTradingHours = TradingHours(
+        startSecondsOfDay=4 * 3600, endSecondsOfDay=20 * 3600, timezone="America/New_York"
+    )
+    # 21:00 UTC on a weekday is 17:00 ET - open. Naive UTC reading would reject it.
+    assert await tradeable(mkt, datetime(2026, 10, 23, 21, tzinfo=UTC))
+    # 02:00 UTC Friday is 22:00 ET Thursday - closed.
+    assert not await tradeable(mkt, datetime(2026, 10, 23, 2, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+async def test_weekends_are_closed_for_scheduled_markets():
+    """regularTradingHours encodes no weekend, so a bare window reads Saturday as open."""
+    mkt = market()
+    mkt.regularTradingHours = TradingHours(
+        startSecondsOfDay=4 * 3600, endSecondsOfDay=20 * 3600, timezone="America/New_York"
+    )
+    assert not await tradeable(mkt, datetime(2026, 10, 24, 15, tzinfo=UTC))  # Saturday
+    assert not await tradeable(mkt, datetime(2026, 10, 25, 15, tzinfo=UTC))  # Sunday
+    assert await tradeable(mkt, datetime(2026, 10, 26, 15, tzinfo=UTC))  # Monday 11:00 ET
+
+
+@pytest.mark.asyncio
+async def test_unknown_timezone_falls_back_to_utc():
+    mkt = market()
+    mkt.regularTradingHours = TradingHours(
+        startSecondsOfDay=4 * 3600, endSecondsOfDay=20 * 3600, timezone="Mars/Olympus"
+    )
+    assert await tradeable(mkt, datetime(2026, 10, 23, 12, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
 async def test_overnight_session_wraps_midnight():
     hours = TradingHours(startSecondsOfDay=22 * 3600, endSecondsOfDay=5 * 3600, isOvernight=True)
     mkt = market()

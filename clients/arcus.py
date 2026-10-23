@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Any, Literal, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from eth_account.messages import encode_defunct, encode_typed_data
@@ -393,10 +394,25 @@ class ArcusClient:
 
         hours = market.regularTradingHours
         if hours is None:
-            return True  # 24/7 market
+            return True  # 24/7 market (crypto)
 
+        # startSecondsOfDay/endSecondsOfDay are in the market's own timezone, not UTC:
+        # SPY-USD reports 14400-72000 with timezone America/New_York, i.e. 04:00-20:00 ET.
         at_utc = at.astimezone(UTC) if at.tzinfo else at.replace(tzinfo=UTC)
-        second_of_day = at_utc.hour * 3600 + at_utc.minute * 60 + at_utc.second
+        try:
+            tz = ZoneInfo(hours.timezone) if hours.timezone else UTC
+        except ZoneInfoNotFoundError:
+            logger.warning(f"Unknown timezone {hours.timezone!r}; treating hours as UTC")
+            tz = UTC
+        local = at_utc.astimezone(tz)
+
+        # Weekends are not encoded in regularTradingHours (nor are holidays), so a
+        # scheduled market would otherwise look open all Saturday. Holidays remain a
+        # known gap - the entry gate and reduce-only closes are the backstop there.
+        if local.weekday() >= 5:
+            return False
+
+        second_of_day = local.hour * 3600 + local.minute * 60 + local.second
         start, end = hours.startSecondsOfDay, hours.endSecondsOfDay
         if hours.isOvernight or start > end:
             return second_of_day >= start or second_of_day < end
