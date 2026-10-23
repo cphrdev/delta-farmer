@@ -134,43 +134,84 @@ class DeltaStrategy:
         logger.info(utils.wait_msg(wait_sec))
         await utils.interruptible_sleep(wait_sec, self.stop_event)
 
-    async def run(self):
-        bals = await self.get_balances(self.accounts)
-        self.initial_bal = bals.total
-        await close_all(self.accounts)  # clean up leftovers from a previous run
+    async def _close_until_flat(self) -> bool:
+        """Retry cleanup until every account is reachable and flat.
 
+        Giving up here is what leaves one leg of a delta-neutral trade open.
+        """
+        delay = 15
+        while True:
+            if await close_all(self.accounts):
+                return True
+            if self.stop_event and self.stop_event.is_set():
+                logger.warning(
+                    "Close incomplete; left remaining positions open so the hedge stays paired"
+                )
+                return False
+            logger.warning(
+                f"Close incomplete; retrying in {delay}s so paired positions stay hedged"
+            )
+            await self._wait(delay)
+            if self.stop_event and self.stop_event.is_set():
+                logger.warning(
+                    "Close incomplete; left remaining positions open so the hedge stays paired"
+                )
+                return False
+            delay = min(delay * 2, 60)
+
+    async def _shutdown_close(self) -> None:
+        logger.info("Stop requested, closing all positions; press Ctrl-C again only to force exit")
+        if not await close_all(self.accounts):
+            logger.warning(
+                "Shutdown close incomplete; left remaining positions open so the hedge stays paired"
+            )
+        logger.info("Shutdown cleanup complete")
+
+    async def run(self):
         failures = 0
+        ready = False
         while True:
             try:
+                if not ready:
+                    bals = await self.get_balances(self.accounts)
+                    self.initial_bal = bals.total
+                    if not await self._close_until_flat():
+                        return
+                    ready = True
+
                 print("-" * 60) if not self.cfg.group_size else None
                 await self.trade_cycle()
                 failures = 0
                 await self._wait(self.cfg.trade_cooldown.sample())
             except asyncio.CancelledError:  # stop_event triggered, time to exit
-                logger.info(
-                    "Stop requested, closing all positions; press Ctrl-C again only to force exit"
-                )
-                await close_all(self.accounts)
-                logger.info("Shutdown cleanup complete")
+                await self._shutdown_close()
                 return
             except Exception as e:
-                await close_all(self.accounts)
-
                 failures += 1
+                error = _format_error(e)
                 if self.cfg.max_failures > 0 and failures >= self.cfg.max_failures:
                     logger.opt(exception=True).error("Too many consecutive failures, stopping")
-                    await tg.on_crash(_format_error(e))
+                    await tg.on_crash(error)
                     # TODO: return exits only this group (others keep running); raise propagates to
                     # CLI and prints ugly traceback; SystemExit(1) kills the whole process cleanly.
                     # Decide which behaviour is correct for multi-group mode.
+                    if not await close_all(self.accounts):
+                        logger.error(
+                            "Stopped with some positions still open; paired accounts were not flattened"
+                        )
                     return
 
                 wait_sec = min(3 * (2 ** (failures - 1)), 60) * 60  # 3m→6m→12m→24m→48m→60m
                 wait_str = utils.format_duration(wait_sec)
-                error = _format_error(e)
-                msg = f"Cycle failed ({failures}) {error}, retrying in {wait_str}"
-                logger.warning(msg)
+                logger.warning(f"Cycle failed ({failures}) {error}")
                 await tg.on_error(error, failures, wait_sec)
+                try:
+                    if not await self._close_until_flat():
+                        return
+                except asyncio.CancelledError:
+                    await self._shutdown_close()
+                    return
+                logger.warning(f"Next cycle in {wait_str}")
                 await self._wait(wait_sec)
 
     async def trade_cycle(self):

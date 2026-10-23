@@ -68,6 +68,25 @@ class CloudflareClearanceUpdated(Exception):
     """Login must be restarted with fresh signing data after clearance."""
 
 
+class TransientGatewayError(ApiError):
+    """Origin or Cloudflare returned a retryable 5xx page."""
+
+
+_LOGIN_ERROR_COOLDOWN = 60.0
+
+
+def _is_transient_status(status: object) -> bool:
+    return isinstance(status, int) and status >= 500
+
+
+def _raise_for_status(rep, msg: str) -> None:
+    if getattr(rep, "ok", False):
+        return
+    status = getattr(rep, "status_code", None)
+    error = TransientGatewayError if _is_transient_status(status) else ApiError
+    raise error(msg, rep)
+
+
 def _is_cloudflare_challenge(rep) -> bool:
     if getattr(rep, "ok", False):
         return False
@@ -257,6 +276,7 @@ class OmniClient:
             cookies_file=f".cache/omni_{utils.short_addr(self.address)}_http.pkl",
         )
         self._login_error: BaseException | None = None
+        self._login_error_until = 0.0
 
     async def _solve_cloudflare(self, method: HttpMethod, url: str, last, *, prefer_managed: bool):
         target_url = (
@@ -288,10 +308,10 @@ class OmniClient:
 
     async def _prepare_login(self) -> None:
         rep = await self._request("GET", f"{APP_URL}/portfolio?tab=positions")  # app access
-        assert rep.ok, f"Login preparation failed: {rep.status_code} {rep.text[:200]}"
+        _raise_for_status(rep, "Login preparation failed")
 
         rep = await self._request("GET", "/banner")  # api access
-        assert rep.ok, f"Login preparation failed: {rep.status_code} {rep.text[:200]}"
+        _raise_for_status(rep, "Login preparation failed")
 
     @retry(max_attempts=3, delay=2.0)  # bypass cloudflare
     async def registered(self) -> bool:
@@ -300,13 +320,15 @@ class OmniClient:
         res = rep.json()
         return res["settlement_pool"] is not None
 
+    @retry_on(TransientGatewayError, retries=2, delay=2.0)
     @retry_on(CloudflareClearanceUpdated, retries=2)
     async def _login(self) -> None:
         await self._prepare_login()
         pld = {"address": self.address}
         rep = await self._request("POST", "/auth/v2/generate_signing_data", json=pld)
+        _raise_for_status(rep, "Signing data request failed")
         try:
-            data = rep.json() if rep.ok else None
+            data = rep.json()
         except Exception:
             data = None
         message = data.get("message") if isinstance(data, dict) else None
@@ -330,7 +352,20 @@ class OmniClient:
                 raise CloudflareClearanceUpdated(
                     "Login rejected after clearance; restarting with fresh signing data"
                 )
+            _raise_for_status(rep, "Login failed")
             raise ApiError("Login failed", rep)
+
+    def _cached_login_error(self) -> BaseException | None:
+        if self._login_error is None:
+            return None
+        if time.monotonic() >= self._login_error_until:
+            self._login_error = None
+            return None
+        return self._login_error
+
+    def _remember_login_error(self, exc: BaseException) -> None:
+        self._login_error = exc
+        self._login_error_until = time.monotonic() + _LOGIN_ERROR_COOLDOWN
 
     def _clear_auth(self) -> None:
         self.http.session.cookies.pop("vr-token", None)
@@ -350,15 +385,18 @@ class OmniClient:
     async def login(self, *, force: bool = False) -> None:
         if force:
             self._login_error = None
+            self._login_error_until = 0.0
             self.http.clear_cookies()
-        elif self._login_error is not None:
-            raise self._login_error
+        elif (cached := self._cached_login_error()) is not None:
+            raise cached
         if force or not await self._check_auth():
             self._clear_auth()
             try:
                 await self._login()
+            except TransientGatewayError:
+                raise
             except Exception as e:
-                self._login_error = e
+                self._remember_login_error(e)
                 raise
 
     async def _call(self, method: HttpMethod, path: str, **kwargs):

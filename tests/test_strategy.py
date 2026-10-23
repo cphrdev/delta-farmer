@@ -550,11 +550,58 @@ async def test_close_all_retries(monkeypatch):
     sleep = AsyncMock()
     monkeypatch.setattr("strategy.execution.asyncio.sleep", sleep)
 
-    await close_all([cast(TradingClient, client)], _attempts=2)
+    assert await close_all([cast(TradingClient, client)], _attempts=2)
 
     assert client.cancel_all_orders.await_count == 2
     assert client.close_all_positions.await_count == 2
     sleep.assert_awaited_once_with(2.0)
+
+
+async def test_close_all_leaves_hedge_open_when_one_account_is_unreachable(monkeypatch):
+    healthy = Client("healthy")
+    blocked = Client("blocked")
+    healthy.close_all_positions = AsyncMock(return_value=1)
+    healthy.cancel_all_orders = AsyncMock(return_value=0)
+    blocked.positions = AsyncMock(side_effect=RuntimeError("Login preparation failed: 502"))
+    blocked.close_all_positions = AsyncMock(return_value=1)
+    blocked.cancel_all_orders = AsyncMock(return_value=0)
+    monkeypatch.setattr("strategy.execution.asyncio.sleep", AsyncMock())
+
+    assert await close_all([cast(TradingClient, healthy), cast(TradingClient, blocked)], 2) is False
+
+    healthy.cancel_all_orders.assert_not_awaited()
+    healthy.close_all_positions.assert_not_awaited()
+    blocked.cancel_all_orders.assert_not_awaited()
+    blocked.close_all_positions.assert_not_awaited()
+
+
+async def test_close_stops_before_any_leg_when_a_hedge_is_unreachable():
+    lead, rest = Client("lead"), Client("rest")
+    lead.positions_value = [position("BTC", "bid", "0.002")]
+    rest.positions = AsyncMock(side_effect=RuntimeError("gateway 502"))
+    lead.close_position = AsyncMock(return_value=True)
+    rest.close_position = AsyncMock(return_value=True)
+
+    with pytest.raises(RuntimeError, match="gateway 502"):
+        await trade(lead, rest).close(make_cfg())
+
+    lead.close_position.assert_not_awaited()
+    rest.close_position.assert_not_awaited()
+
+
+async def test_failure_retries_close_until_flat(monkeypatch):
+    strategy = DeltaStrategy(make_cfg(), cast(list[TradingClient], [Client("a"), Client("b")]))
+    calls = {"n": 0}
+
+    async def cleanup(_accs):
+        calls["n"] += 1
+        return calls["n"] == 2
+
+    monkeypatch.setattr("strategy.cycle.close_all", cleanup)
+    monkeypatch.setattr("strategy.cycle.DeltaStrategy._wait", AsyncMock())
+
+    assert await strategy._close_until_flat() is True
+    assert calls["n"] == 2
 
 
 async def test_failure_closes_positions(monkeypatch):

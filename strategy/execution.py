@@ -364,23 +364,80 @@ async def fill_limit_order(
 # MARK: Execution primitives
 
 
-async def close_all(accs: Sequence[TradingClient], _attempts: int = 3) -> None:
-    """Best-effort cleanup — retries on failure, never raises. cancel/close are idempotent."""
-    n_failed = 0
+def _close_failure_text(error: BaseException) -> str:
+    detail = " ".join(str(error).split())
+    if len(detail) > 180:
+        return detail[:180] + "..."
+    return detail
+
+
+async def close_all(accs: Sequence[TradingClient], _attempts: int = 3) -> bool:
+    """Close every account, or close none.
+
+    A position is sent only after every account can be read. Closing the
+    accounts that still answer, while others are down, breaks a delta-neutral
+    hedge. Cancel and close stay idempotent, so a later attempt can finish
+    whatever the first attempt started.
+    """
+    pending = list(accs)
     for attempt in range(_attempts):
-        rs1 = await asyncio.gather(*[a.cancel_all_orders() for a in accs], return_exceptions=True)
-        rs2 = await asyncio.gather(*[a.close_all_positions() for a in accs], return_exceptions=True)
+        reads = await asyncio.gather(*[acc.positions() for acc in pending], return_exceptions=True)
+        for result in reads:
+            if isinstance(result, BaseException) and not isinstance(result, Exception):
+                raise result
+        blocked = [
+            (acc, result) for acc, result in zip(pending, reads) if isinstance(result, Exception)
+        ]
+        if blocked:
+            detail = _close_failure_text(blocked[0][1])
+            if attempt < _attempts - 1:
+                logger.warning(
+                    f"close_all: {len(blocked)}/{len(pending)} account(s) unreachable ({detail}), "
+                    f"retrying ({attempt + 1}/{_attempts}) without closing the others..."
+                )
+                await asyncio.sleep(2.0 * 2**attempt)
+                continue
+            logger.warning(
+                f"close_all: {len(blocked)} account(s) unreachable after {_attempts} attempts "
+                f"({detail}); left positions open to keep hedges paired"
+            )
+            return False
+
+        rs1 = await asyncio.gather(
+            *[acc.cancel_all_orders() for acc in pending], return_exceptions=True
+        )
+        rs2 = await asyncio.gather(
+            *[acc.close_all_positions() for acc in pending], return_exceptions=True
+        )
+
+        for result in [*rs1, *rs2]:
+            if isinstance(result, BaseException) and not isinstance(result, Exception):
+                raise result
 
         n_orders = sum(r for r in rs1 if isinstance(r, int))
         n_positions = sum(r for r in rs2 if isinstance(r, int))
-        n_failed = sum(1 for r in [*rs1, *rs2] if isinstance(r, Exception))
+        failed: list[tuple[TradingClient, Exception]] = []
+        for acc, r1, r2 in zip(pending, rs1, rs2):
+            error = r1 if isinstance(r1, Exception) else r2 if isinstance(r2, Exception) else None
+            if error is not None:
+                failed.append((acc, error))
         if n_orders + n_positions > 0:
             logger.info(f"Closed {n_orders} orders and {n_positions} positions")
-        if not n_failed:
-            return
+        if not failed:
+            return True
 
+        pending = [acc for acc, _error in failed]
+        detail = _close_failure_text(failed[0][1])
         if attempt < _attempts - 1:
-            logger.warning(f"close_all: {n_failed} failed, retrying ({attempt + 1}/{_attempts})...")
+            logger.warning(
+                f"close_all: {len(failed)} failed ({detail}), retrying ({attempt + 1}/{_attempts})..."
+            )
             await asyncio.sleep(2.0 * 2**attempt)
+            continue
 
-    logger.warning(f"close_all: still {n_failed} account(s) failed after {_attempts} attempts")
+        logger.warning(
+            f"close_all: still {len(failed)} account(s) failed after {_attempts} attempts ({detail})"
+        )
+        return False
+
+    return False

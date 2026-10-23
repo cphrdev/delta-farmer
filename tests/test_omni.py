@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from clients.omni import (
-    CloudflareClearanceUpdated,
     IndicativeQuote,
     OmniClient,
     OmniSupportedAsset,
     OmniTradingSchedule,
     OmniTradingSession,
+    TransientGatewayError,
     _is_cloudflare_challenge,
 )
 from lib.http import ApiError, AsyncHttp
@@ -34,6 +34,7 @@ def client():
     value.http = Mock()
     value.http.session.cookies = {}
     value._login_error = None
+    value._login_error_until = 0.0
     value._prepare_login = AsyncMock()
     value._request = AsyncMock()
     return value
@@ -163,6 +164,79 @@ async def test_login_does_not_rerun_after_failure(client):
     assert [call.args[1] for call in client._request.await_args_list] == [
         "/auth/v2/generate_signing_data"
     ]
+
+
+def _gateway_page(status: int = 502):
+    return Mock(ok=False, status_code=status, text="<!DOCTYPE html><html>bad gateway</html>")
+
+
+async def test_login_retries_gateway_error_and_does_not_cache_it(client, monkeypatch):
+    monkeypatch.setattr("lib.decorators.asyncio.sleep", AsyncMock())
+    calls = {"n": 0}
+
+    async def request(_method, path, **_kwargs):
+        if path == "/auth/v2/generate_signing_data":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _gateway_page()
+            return _signing_data()
+        client.http.session.cookies["vr-token"] = "new"
+        return Mock(ok=True, status_code=200, text="ok")
+
+    client._request.side_effect = request
+
+    await client.login()
+
+    assert calls["n"] == 2
+    assert client._login_error is None
+
+
+async def test_gateway_login_failure_is_retried_on_the_next_call(client, monkeypatch):
+    monkeypatch.setattr("lib.decorators.asyncio.sleep", AsyncMock())
+    client._request.return_value = _gateway_page()
+
+    with pytest.raises(TransientGatewayError, match=r"Signing data request failed: 502 \[html\]"):
+        await client.login()
+    with pytest.raises(TransientGatewayError, match=r"Signing data request failed: 502 \[html\]"):
+        await client.login()
+
+    assert client._prepare_login.await_count == 6
+    assert client._login_error is None
+
+
+async def test_login_preparation_reports_gateway_status(client):
+    client._prepare_login = OmniClient._prepare_login.__get__(client, OmniClient)
+    client._request.return_value = _gateway_page()
+
+    with pytest.raises(TransientGatewayError, match=r"Login preparation failed: 502 \[html\]"):
+        await client._prepare_login()
+
+
+async def test_sticky_login_error_expires(client, monkeypatch):
+    now = {"t": 1_000.0}
+    monkeypatch.setattr("clients.omni.time.monotonic", lambda: now["t"])
+    client._request.side_effect = ApiError("Login failed")
+
+    with pytest.raises(ApiError, match="Login failed"):
+        await client.login()
+    client._prepare_login.reset_mock()
+
+    with pytest.raises(ApiError, match="Login failed"):
+        await client.login()
+    client._prepare_login.assert_not_awaited()
+
+    now["t"] += 61
+
+    async def request(_method, path, **_kwargs):
+        if path == "/auth/v2/generate_signing_data":
+            return _signing_data()
+        client.http.session.cookies["vr-token"] = "new"
+        return Mock(ok=True, status_code=200, text="ok")
+
+    client._request.side_effect = request
+    await client.login()
+
+    client._prepare_login.assert_awaited_once()
 
 
 async def test_login_restarts_with_fresh_signing_data_after_rejected_login(client):

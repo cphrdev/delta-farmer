@@ -225,20 +225,53 @@ class DeltaTrade:
         return True
 
     async def close(self, cfg: TradeConfig, use_limit=False) -> None:
+        # Read every leg before sending a close. One unreachable account must not
+        # flatten the legs that still answer.
+        snapshots = await asyncio.gather(
+            *[self._positions(leg.client) for leg in self.legs], return_exceptions=True
+        )
+        errors: list[Exception] = []
+        positions_by_leg: list[list[Position]] = []
+        for item in snapshots:
+            if isinstance(item, BaseException) and not isinstance(item, Exception):
+                raise item
+            if isinstance(item, Exception):
+                errors.append(item)
+                continue
+            positions_by_leg.append(item)
+        if errors:
+            raise errors[0]
+
         if use_limit:
-            for pos in await self._positions(self.lead.client):
+            for pos in positions_by_leg[0]:
                 clt, side = self.lead.client, opposite_side(pos.side)
                 await _fill_limit_order(clt, pos.symbol, side, pos.size, cfg, reduce_only=True)
 
-        async def _close(leg: DeltaLeg) -> None:
-            for pos in await self._positions(leg.client):
-                await leg.client.close_position(pos)
-                log = logger.bind(account=leg.client.name)
-                log.debug(f"Closed {pos.size} {self.symbol} with market order")
-
         legs = self.legs if not use_limit else self.rest
-        await asyncio.gather(*[_close(leg) for leg in legs])
+        found = positions_by_leg if not use_limit else positions_by_leg[1:]
+        await asyncio.gather(
+            *[self._close_leg(leg, positions) for leg, positions in zip(legs, found)]
+        )
         # todo: report closed log with spread info
+
+    async def _close_leg(self, leg: DeltaLeg, positions: list[Position]) -> None:
+        delay = 1.0
+        for attempt in range(3):
+            try:
+                for pos in positions:
+                    await leg.client.close_position(pos)
+                    log = logger.bind(account=leg.client.name)
+                    log.debug(f"Closed {pos.size} {self.symbol} with market order")
+                return
+            except Exception:
+                if attempt == 2:
+                    raise
+                logger.warning(
+                    f"{leg.client.name}: close failed ({attempt + 1}/3), retrying in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+                positions = await self._positions(leg.client)
 
     # MARK: Monitoring
 
