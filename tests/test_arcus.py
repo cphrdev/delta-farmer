@@ -130,6 +130,27 @@ def test_max_leverage_from_initial_margin_fraction():
     assert market().max_leverage == 20
 
 
+# MARK: api key naming
+
+
+def test_api_wallet_name_is_unique_stable_and_unrevealing():
+    """The label is visible in the Arcus UI, so a shared literal would link the accounts."""
+    from eth_account import Account
+
+    from clients.arcus import api_wallet_name
+
+    addrs = [Account.from_key("0x" + f"{i:02x}" * 32).address for i in range(1, 60)]
+    names = [api_wallet_name(a) for a in addrs]
+
+    assert len(set(names)) == len(names), "names must differ per account"
+    assert all(api_wallet_name(a) == n for a, n in zip(addrs, names)), "must be stable"
+    # case-insensitive on the address, since callers may pass either form
+    assert api_wallet_name(addrs[0].lower()) == names[0]
+    for n in names:
+        assert 1 <= len(n) <= 64  # server bound
+        assert "delta" not in n and "farmer" not in n and "arcus" not in n
+
+
 # MARK: privy siwe message
 
 

@@ -57,8 +57,30 @@ PRIVY_STATEMENT = (
 )
 PRIVY_TOKEN_TTL = timedelta(minutes=45)  # identity tokens are short-lived
 
-API_KEY_NAME = "delta-farmer"
+# API key labels are visible in the Arcus UI and identical names across accounts would
+# link them. Derived from the address so each account gets its own stable, unrevealing
+# name rather than a shared literal.
+_NAME_HEADS = (
+    "atlas", "aster", "basis", "cobalt", "ember", "harbor", "indigo", "juniper",
+    "lumen", "meridian", "nimbus", "onyx", "quartz", "ridge", "solace", "tundra",
+    "vertex", "willow", "zephyr", "cinder", "fathom", "kestrel", "lattice", "marlin",
+)  # fmt: skip
+_NAME_TAILS = (
+    "alpha", "arc", "beam", "capital", "edge", "flow", "grid", "labs",
+    "markets", "node", "quant", "signal", "stack", "systems", "vector", "works",
+)  # fmt: skip
+
+
+def api_wallet_name(address: str) -> str:
+    """Stable per-account label, e.g. "meridian-vector-8c1f"."""
+    digest = sha256(f"arcus-api-name:{address.lower()}".encode()).digest()
+    head = _NAME_HEADS[digest[0] % len(_NAME_HEADS)]
+    tail = _NAME_TAILS[digest[1] % len(_NAME_TAILS)]
+    return f"{head}-{tail}-{digest[2:4].hex()}"
+
+
 API_KEY_TTL = timedelta(days=30)  # server allows 1..180 days
+API_KEY_RENEW_BEFORE = timedelta(days=1)  # re-register only once the key is nearly stale
 GOOD_TIL = timedelta(days=40)  # must be >= 1 month ahead or the order is rejected
 MARKET_SLIPPAGE = Decimal("0.05")  # MARKET orders must price within 10% of mark
 QUANTUMS = Decimal(10) ** 9  # quote quantums per $1
@@ -204,6 +226,7 @@ class ArcusClient:
         self.address = self.account.address
         self.name = name
         self.account_index = account_index
+        self.api_wallet_name = api_wallet_name(self.address)
         self._api_key_valid_until: datetime | None = None
         self._privy_token: str | None = None
         self._privy_token_at: datetime | None = None
@@ -252,20 +275,43 @@ class ArcusClient:
 
     # MARK: Lifecycle
 
+    async def _registered_key_expiry(self) -> datetime | None:
+        """Expiry of our Ed25519 key as the exchange sees it, or None if not registered."""
+        res = await self._call("GET", f"/v1/apiKeys?address={self.address}")
+        for key in (res or {}).get("apiKeys", []):
+            if key.get("apiKey") != self.api_key or key.get("status") != "ACTIVE":
+                continue
+            valid_until = key.get("validUntil")
+            if not valid_until:
+                return datetime.max.replace(tzinfo=UTC)  # registered with no expiry
+            return datetime.fromtimestamp(valid_until / 1000, UTC)
+        return None
+
     @locked
     async def login(self, *, force: bool = False) -> None:
         now = datetime.now(UTC)
         if (
             not force
             and self._api_key_valid_until
-            and self._api_key_valid_until - now > timedelta(days=1)
+            and self._api_key_valid_until - now > API_KEY_RENEW_BEFORE
         ):
             return
+
+        # The expiry only lived in memory, so every process start used to re-register a
+        # key that was already ACTIVE. Ask the exchange instead: that costs one GET
+        # rather than an EIP-712 signature, and avoids the brief window after
+        # registration in which a key is not yet usable.
+        if not force:
+            expiry = await self._registered_key_expiry()
+            if expiry and expiry - now > API_KEY_RENEW_BEFORE:
+                self._api_key_valid_until = expiry
+                logger.debug(f"API key already active until {expiry:%Y-%m-%d}")
+                return
 
         valid_until = int((now + API_KEY_TTL).timestamp() * 1_000)
         nonce = str(time.time_ns())
         message = {
-            "apiWalletName": API_KEY_NAME,
+            "apiWalletName": self.api_wallet_name,
             "apiWalletPublicKey": self.api_key,
             "validUntil": valid_until,
             "nonce": nonce,
@@ -296,7 +342,7 @@ class ArcusClient:
             json={
                 "address": self.address,
                 "publicKey": self.api_key,
-                "apiWalletName": API_KEY_NAME,
+                "apiWalletName": self.api_wallet_name,
                 "accountIndex": self.account_index,
                 "validUntil": valid_until,
                 "nonce": nonce,
