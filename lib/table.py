@@ -12,7 +12,7 @@ from rich.box import SIMPLE, Box
 from rich.console import JustifyMethod
 from rich.table import Table
 
-from . import telemetry
+from . import reports, telemetry
 from .logger import logger
 
 _TBD = object()  # sentinel: not enough data to compute
@@ -174,7 +174,9 @@ class AutoTable:
         return tbl
 
     def print(self):
-        console_print(self.render())
+        table = self.render()
+        console_print(table)
+        reports.capture(table)
 
 
 # MARK: Stats rendering

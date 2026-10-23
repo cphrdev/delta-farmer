@@ -13,5 +13,7 @@ __pycache__/
 3rd/
 configs/
 logs/
+info_data/
+stats_data/
 /gateway/
 /tools/

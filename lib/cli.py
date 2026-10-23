@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, Field
 from rich.console import Console
 
-from . import support, telemetry
+from . import reports, support, telemetry
 from . import telegram as tg
 from .crypto import config_cli_parser
 from .errors import AppError
@@ -378,6 +378,9 @@ async def create_cli(
         await _handle_license()
         sys.exit(0)
 
+    if args.command in {"info", "stats"}:
+        reports.begin(args.command, name)
+
     if args.command == "trade" and _env_enabled("DF_LOG_FILE"):
         enable_file_logging(name)
 
@@ -427,3 +430,5 @@ def run_app(coro: Coroutine) -> None:
         logger.error(str(e))
     except KeyboardInterrupt:
         pass
+    finally:
+        reports.flush()
