@@ -48,6 +48,7 @@ Each exchange has a launcher under `apps/`. Use the launcher name as `<app>` in 
 | App        | Exchange                                                          | Wallet | Deposit / withdraw | Extra tools                   |
 | ---------- | ----------------------------------------------------------------- | ------ | ------------------ | ----------------------------- |
 | `entropy`  | [Entropy](https://entropy.io/)                                    | EVM    | —                  | Unified Account migration     |
+| `jumper`   | [Jumper Perps](https://perps.jumper.xyz/) on Hyperliquid          | EVM    | —                  | Orders routed through LI.FI   |
 | `lighter`  | [Lighter on Robinhood Chain](https://robinhoodchain.lighter.xyz/) | EVM    | Yes                | Referral codes                |
 | `n1`       | [N1](https://app.n1.xyz/r/vladkens)                               | EVM    | —                  | —                             |
 | `nado`     | [Nado](https://app.nado.xyz?join=yUAjz7a)                         | EVM    | —                  | —                             |
@@ -153,7 +154,7 @@ uv run apps/omni.py close
 | `close`                                      | All active launchers                 | Cancel open orders and close all positions on enabled accounts.                  |
 | `positions`                                  | All active launchers                 | Show current positions and risk metrics.                                         |
 | `info`                                       | All active launchers                 | Show balances and exchange-specific account metrics.                             |
-| `stats [FILTER] [-g {week,day}] [--force]`   | All except Entropy and TradeXYZ      | Show period statistics and optionally refresh cached history.                    |
+| `stats [FILTER] [-g {week,day}] [--force]`   | All except Entropy, Jumper, and TradeXYZ | Show period statistics and optionally refresh cached history.                    |
 | `addrs`                                      | All active launchers                 | Show the wallet address derived for every configured account.                    |
 | `login [--force]`                            | All active launchers                 | Check account sessions and retry failed logins; `--force` starts fresh sessions. |
 | `proxy`                                      | All active launchers                 | Check configured proxies, public IPs, and latency.                               |
@@ -220,6 +221,37 @@ Basket mode trades two to four symbols in the same cycle. Here `symbols_per_trad
 symbols = ["BTC", "ETH"]
 symbols_per_trade = 2
 ```
+
+### Jumper
+
+Jumper trades native Hyperliquid markets through [LI.FI's perps API](https://public-perps-docs.mintlify.app), which is the API behind Jumper Perps. Orders are sent with no API key, so they carry LI.FI's default builder fee and show up in Jumper's activity record. Balances, positions, and order status are still read from Hyperliquid.
+
+Deposit on Hyperliquid first. The first `login` accepts Jumper's current terms, approves a trading agent derived from the account key, and approves the builder fee. That builder fee is charged on fills in addition to Hyperliquid's own fee. Jumper does not publish an xPerps balance, so `info` shows Hyperliquid volume and P/L.
+
+```bash
+uv run apps/jumper.py config new
+```
+
+```toml
+leverage = 10
+symbols = ["BTC", "ETH"]
+symbols_per_trade = 1
+use_limit = true
+first_as_prime = true
+
+trade_size_usd = { min = 140, max = 160 }
+trade_duration = { min = "15m", max = "20m" }
+trade_cooldown = { min = "3m", max = "6m" }
+```
+
+```bash
+uv run apps/jumper.py config encrypt
+uv run apps/jumper.py login
+uv run apps/jumper.py info
+uv run apps/jumper.py trade
+```
+
+`deposit`, `withdraw`, and `stats` are not available. Close everything with `uv run apps/jumper.py close`.
 
 ### Trade.xyz
 
