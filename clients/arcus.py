@@ -19,7 +19,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from typing import Any, Literal, Self
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from eth_account.messages import encode_defunct, encode_typed_data
@@ -132,6 +131,11 @@ class ArcusMarket(BaseModel):
     minOrderSize: Decimal
     minOrderNotional: Decimal
     initialMarginFraction: Decimal | None = None
+    offHoursInitialMarginFraction: Decimal | None = None
+    isOutsideRth: bool | None = None  # null on crypto markets, which have no RTH
+    upperTradingBound: Decimal | None = None
+    lowerTradingBound: Decimal | None = None
+    currentSettlementPrice: Decimal | None = None
     markPrice: Decimal | None = None
     oraclePrice: Decimal | None = None
     lastTradePrice: Decimal | None = None
@@ -147,8 +151,22 @@ class ArcusMarket(BaseModel):
 
     @property
     def max_leverage(self) -> int:
+        """Outside regular hours non-crypto markets carry a 50% initial-margin surcharge,
+        so the permitted leverage is lower than the headline figure."""
         imf = self.initialMarginFraction
+        if self.isOutsideRth and self.offHoursInitialMarginFraction:
+            imf = self.offHoursInitialMarginFraction
         return int(1 / imf) if imf and imf > 0 else 1
+
+    def clamp_to_bounds(self, price: Decimal) -> Decimal:
+        """Off-hours trades must land inside a band around the last RTH settlement price.
+        A marketable price computed from plain slippage can sit outside it and be rejected.
+        """
+        if self.lowerTradingBound is not None:
+            price = max(price, self.lowerTradingBound)
+        if self.upperTradingBound is not None:
+            price = min(price, self.upperTradingBound)
+        return price
 
 
 class ArcusPosition(BaseModel):
@@ -201,6 +219,16 @@ class ArcusPoints(BaseModel):
     tier: str | None = None
     next_drop_at: str | None = None
     seasons: list[ArcusSeason] = Field(default_factory=list)
+
+
+class ArcusLeaderboard(BaseModel):
+    """Per-address row. Monetary fields are quote quantums (1e9 == $1)."""
+
+    address: str
+    volume: Decimal = Decimal(0)
+    feesPaid: Decimal = Decimal(0)
+    pnl: Decimal = Decimal(0)  # realized only; unrealized mark-to-market excluded
+    rank: int | None = None
 
 
 class ArcusStats(BaseModel):
@@ -388,35 +416,12 @@ class ArcusClient:
         return [m.marketDisplayName for m in sorted(online, key=lambda m: -m.volume24hNotional)]
 
     async def is_symbol_tradeable(self, symbol: str, at: datetime, reduce_only=False) -> bool:
-        market = await self._market(symbol)
-        if market.status != "ONLINE":
-            return False
-
-        hours = market.regularTradingHours
-        if hours is None:
-            return True  # 24/7 market (crypto)
-
-        # startSecondsOfDay/endSecondsOfDay are in the market's own timezone, not UTC:
-        # SPY-USD reports 14400-72000 with timezone America/New_York, i.e. 04:00-20:00 ET.
-        at_utc = at.astimezone(UTC) if at.tzinfo else at.replace(tzinfo=UTC)
-        try:
-            tz = ZoneInfo(hours.timezone) if hours.timezone else UTC
-        except ZoneInfoNotFoundError:
-            logger.warning(f"Unknown timezone {hours.timezone!r}; treating hours as UTC")
-            tz = UTC
-        local = at_utc.astimezone(tz)
-
-        # Weekends are not encoded in regularTradingHours (nor are holidays), so a
-        # scheduled market would otherwise look open all Saturday. Holidays remain a
-        # known gap - the entry gate and reduce-only closes are the backstop there.
-        if local.weekday() >= 5:
-            return False
-
-        second_of_day = local.hour * 3600 + local.minute * 60 + local.second
-        start, end = hours.startSecondsOfDay, hours.endSecondsOfDay
-        if hours.isOvernight or start > end:
-            return second_of_day >= start or second_of_day < end
-        return start <= second_of_day < end
+        # Equity perps trade CONTINUOUSLY on Arcus, nights and weekends included.
+        # regularTradingHours only says which margin/pricing regime applies - outside it
+        # initial margin carries a 50% surcharge and prices sit inside a band around the
+        # last settlement price - not whether the market accepts orders. `status` is the
+        # only tradability gate, so never reject on the clock here.
+        return (await self._market(symbol)).status == "ONLINE"
 
     async def get_lot_size(self, symbol: str) -> Decimal:
         return (await self._market(symbol)).stepSize
@@ -531,18 +536,37 @@ class ArcusClient:
             raise ApiError("Points request failed", rep)
         return ArcusPoints(**rep.json())
 
+    async def leaderboard_entry(self) -> ArcusLeaderboard | None:
+        """Our own leaderboard row, the only source of realized P/L Arcus exposes.
+
+        `window=all` is required: without it the address filter is ignored and the global
+        top-N comes back instead, so the address is re-checked before trusting the row.
+        """
+        res = await self._call("GET", f"/v1/leaderboard?address={self.address}&window=all")
+        for raw in (res or {}).get("entries", []):
+            if raw.get("address", "").lower() == self.address.lower():
+                return ArcusLeaderboard(**raw)
+        return None
+
     async def stats(self) -> ArcusStats:
         res = await self._call("GET", f"/v1/account/stats?address={self.address}&include=volumes")
         return ArcusStats(**res) if res else ArcusStats()
 
     async def profile(self) -> ProfileInfo:
-        account, stats, points = await asyncio.gather(
-            self._account(), self.stats(), self.points(), return_exceptions=True
+        account, stats, points, board = await asyncio.gather(
+            self._account(),
+            self.stats(),
+            self.points(),
+            self.leaderboard_entry(),
+            return_exceptions=True,
         )
         if isinstance(account, BaseException):
             raise account
         if isinstance(stats, BaseException):
             raise stats
+        if isinstance(board, BaseException):
+            logger.debug(f"leaderboard unavailable: {board}")
+            board = None
         if isinstance(points, BaseException):
             # Points ride on third-party (Privy) auth; never let them break the report.
             logger.debug(f"points unavailable: {points}")
@@ -553,10 +577,13 @@ class ArcusClient:
         return ProfileInfo(
             addr=utils.short_addr(self.address),
             balance=account.equity,
-            volume=stats.lifetimeVolume / QUANTUMS,
-            pnl=account.netQuoteBalance - account.netDeposits,
+            volume=(board.volume if board else stats.lifetimeVolume) / QUANTUMS,
+            # Realized P/L from the leaderboard. The balance-derived fallback uses equity,
+            # not netQuoteBalance: a fill moves cash into the position, so netQuoteBalance
+            # tracks the cash leg of open positions rather than profit.
+            pnl=(board.pnl / QUANTUMS) if board else (account.equity - account.netDeposits),
             points=points.season_points,
-            rank=points.season_rank,
+            rank=points.season_rank or (board.rank if board else None),
             mode=points.tier,
         )
 
@@ -663,11 +690,14 @@ class ArcusClient:
 
     async def market_order(self, symbol: str, side: Side, qty: Decimal, reduce_only=False) -> Order:
         # Arcus has no unpriced market order: MARKET must be IOC and priced within 10%
-        # of mark, so cross the book by a bounded margin instead.
-        mark = await self.get_price(symbol)
+        # of mark, so cross the book by a bounded margin instead. Off-hours equity perps
+        # additionally confine prices to a band around the last settlement price, and a
+        # plain 5% cross lands outside it - clamp before sending.
+        market = await self._market(symbol)
         slip = Decimal(1) + (MARKET_SLIPPAGE if side == "bid" else -MARKET_SLIPPAGE)
+        price = market.clamp_to_bounds(market.price * slip)
         return await self._place(
-            symbol, side, qty, mark * slip, order_type="MARKET", tif="IOC", reduce_only=reduce_only
+            symbol, side, qty, price, order_type="MARKET", tif="IOC", reduce_only=reduce_only
         )
 
     async def limit_order(

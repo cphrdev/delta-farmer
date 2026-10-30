@@ -10,7 +10,7 @@ from eth_account.messages import encode_typed_data
 from eth_account.signers.local import LocalAccount
 from eth_utils.crypto import keccak
 
-from lib.decorators import bind_log_context, locked
+from lib.decorators import bind_log_context, locked, ttl_cache
 from lib.errors import AppError
 from lib.http import ApiError, AsyncHttp
 from lib.logger import logger
@@ -187,6 +187,27 @@ class JumperClient(HyperLiquidClient):
                 raise
             logger.warning(f"Jumper referral was not applied: {error}")
             return "referrer skipped"
+
+    @ttl_cache(3600)
+    async def _routable_symbols(self) -> list[str]:
+        """Perp markets LI.FI will build orders for, HIP-3 dexes (`xyz:`, `io:`) included.
+
+        LI.FI is the authority here, not Hyperliquid's `meta`: the native universe omits
+        HIP-3 coins entirely, and a HIP-3 market LI.FI has not onboarded is rejected at
+        build time even though Hyperliquid lists it. Spot entries (`@1`, `PURR/USDC`) are
+        dropped because they are not perps, and delisted markets still appear in the feed.
+        """
+        rep = await self._api.request("GET", "/markets", params={"provider": PROVIDER})
+        if not rep.ok:
+            raise ApiError("Jumper markets error", rep)
+        return [
+            market["id"]
+            for market in rep.json().get("markets", [])
+            if market.get("categoryId") != "spot" and not market.get("isDelisted")
+        ]
+
+    async def get_symbols(self) -> list[str]:
+        return await self._routable_symbols()
 
     async def set_leverage(self, symbol: str, leverage: int) -> None:
         await self._run(

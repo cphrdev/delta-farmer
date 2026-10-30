@@ -130,6 +130,33 @@ def test_max_leverage_from_initial_margin_fraction():
     assert market().max_leverage == 20
 
 
+# MARK: realized pnl source
+
+
+def test_leaderboard_row_must_match_our_address():
+    """Without window=all the address filter is ignored and the global top-N returns, so
+    a row for someone else must never be mistaken for ours."""
+    from clients.arcus import ArcusLeaderboard
+
+    acc = client()
+    entries: list[dict[str, object]] = [
+        {"address": "0xdeadbeef00000000000000000000000000000000", "volume": 1, "pnl": 999},
+        {"address": acc.address.lower(), "volume": 129863166402551, "pnl": -87673610457},
+    ]
+    match = next((e for e in entries if str(e["address"]).lower() == acc.address.lower()), None)
+    assert match is not None
+    row = ArcusLeaderboard.model_validate(match)
+    assert row.pnl == Decimal(-87673610457)
+    assert row.volume / (Decimal(10) ** 9) == Decimal("129863.166402551")
+
+
+def test_quantum_scaling():
+    from clients.arcus import QUANTUMS
+
+    assert Decimal(10) ** 9 == QUANTUMS  # 1e9 quantums == $1
+    assert Decimal(-87673610457) / QUANTUMS == Decimal("-87.673610457")
+
+
 # MARK: api key naming
 
 
@@ -228,60 +255,41 @@ async def test_offline_market_is_never_tradeable():
 
 
 @pytest.mark.asyncio
-async def test_market_without_hours_is_always_tradeable():
-    assert await tradeable(market(), datetime(2026, 5, 29, 3, tzinfo=UTC))
-
-
-@pytest.mark.asyncio
-async def test_regular_hours_window_is_enforced():
-    hours = TradingHours(startSecondsOfDay=13 * 3600 + 1800, endSecondsOfDay=20 * 3600)
-    mkt = market()
-    mkt.regularTradingHours = hours
-    assert await tradeable(mkt, datetime(2026, 5, 29, 15, tzinfo=UTC))
-    assert not await tradeable(mkt, datetime(2026, 5, 29, 21, tzinfo=UTC))
-    assert not await tradeable(mkt, datetime(2026, 5, 29, 13, tzinfo=UTC))
-
-
-@pytest.mark.asyncio
-async def test_hours_are_market_local_not_utc():
-    """SPY-USD reports 14400-72000 with timezone America/New_York (04:00-20:00 ET).
-    Reading those seconds as UTC closes the market eight hours early."""
+async def test_equity_perps_trade_continuously():
+    """Arcus equity perps trade nights and weekends; regularTradingHours only selects the
+    margin/pricing regime. Gating on the clock here idles ~60% of the week for nothing."""
     mkt = market()
     mkt.regularTradingHours = TradingHours(
         startSecondsOfDay=4 * 3600, endSecondsOfDay=20 * 3600, timezone="America/New_York"
     )
-    # 21:00 UTC on a weekday is 17:00 ET - open. Naive UTC reading would reject it.
-    assert await tradeable(mkt, datetime(2026, 10, 23, 21, tzinfo=UTC))
-    # 02:00 UTC Friday is 22:00 ET Thursday - closed.
-    assert not await tradeable(mkt, datetime(2026, 10, 23, 2, tzinfo=UTC))
+    for at in (
+        datetime(2026, 10, 24, 15, tzinfo=UTC),  # Saturday
+        datetime(2026, 10, 25, 7, tzinfo=UTC),  # Sunday 02:00 ET
+        datetime(2026, 10, 26, 2, tzinfo=UTC),  # Sunday 22:00 ET
+        datetime(2026, 10, 26, 15, tzinfo=UTC),  # Monday 11:00 ET
+    ):
+        assert await tradeable(mkt, at), at
 
 
-@pytest.mark.asyncio
-async def test_weekends_are_closed_for_scheduled_markets():
-    """regularTradingHours encodes no weekend, so a bare window reads Saturday as open."""
+def test_off_hours_leverage_uses_the_margin_surcharge():
     mkt = market()
-    mkt.regularTradingHours = TradingHours(
-        startSecondsOfDay=4 * 3600, endSecondsOfDay=20 * 3600, timezone="America/New_York"
-    )
-    assert not await tradeable(mkt, datetime(2026, 10, 24, 15, tzinfo=UTC))  # Saturday
-    assert not await tradeable(mkt, datetime(2026, 10, 25, 15, tzinfo=UTC))  # Sunday
-    assert await tradeable(mkt, datetime(2026, 10, 26, 15, tzinfo=UTC))  # Monday 11:00 ET
+    mkt.initialMarginFraction = Decimal("0.02")
+    mkt.offHoursInitialMarginFraction = Decimal("0.03")  # +50% surcharge
+    mkt.isOutsideRth = False
+    assert mkt.max_leverage == 50
+    mkt.isOutsideRth = True
+    assert mkt.max_leverage == 33
 
 
-@pytest.mark.asyncio
-async def test_unknown_timezone_falls_back_to_utc():
+def test_prices_are_clamped_into_the_off_hours_band():
+    """Off-hours trades must sit inside a band around the last settlement price; a plain
+    5% cross lands outside it and the order is rejected."""
     mkt = market()
-    mkt.regularTradingHours = TradingHours(
-        startSecondsOfDay=4 * 3600, endSecondsOfDay=20 * 3600, timezone="Mars/Olympus"
-    )
-    assert await tradeable(mkt, datetime(2026, 10, 23, 12, tzinfo=UTC))
-
-
-@pytest.mark.asyncio
-async def test_overnight_session_wraps_midnight():
-    hours = TradingHours(startSecondsOfDay=22 * 3600, endSecondsOfDay=5 * 3600, isOvernight=True)
-    mkt = market()
-    mkt.regularTradingHours = hours
-    assert await tradeable(mkt, datetime(2026, 5, 29, 23, tzinfo=UTC))
-    assert await tradeable(mkt, datetime(2026, 5, 29, 2, tzinfo=UTC))
-    assert not await tradeable(mkt, datetime(2026, 5, 29, 12, tzinfo=UTC))
+    mkt.lowerTradingBound = Decimal("752.92")
+    mkt.upperTradingBound = Decimal("768.12")
+    assert mkt.clamp_to_bounds(Decimal("798.68")) == Decimal("768.12")
+    assert mkt.clamp_to_bounds(Decimal("700.00")) == Decimal("752.92")
+    assert mkt.clamp_to_bounds(Decimal("760.50")) == Decimal("760.50")
+    # crypto has no bands - the price passes through untouched
+    crypto = market()
+    assert crypto.clamp_to_bounds(Decimal("84786.13")) == Decimal("84786.13")

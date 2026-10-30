@@ -248,3 +248,58 @@ async def test_unconfirmed_market_fill_is_not_sent_again(monkeypatch):
         await client._place_order("BTC", "ask", Decimal("0.02"), Decimal("100"), "FrontendMarket")
 
     assert client._api.request.await_count == 2
+
+
+_MARKETS = {
+    "markets": [
+        {"id": "BTC", "categoryId": "hyperliquid", "isDelisted": False},
+        {"id": "xyz:XYZ100", "categoryId": "xyz", "isDelisted": False},
+        {"id": "io:ETH", "categoryId": "io", "isDelisted": False},
+        {"id": "xyz:OLDCO", "categoryId": "xyz", "isDelisted": True},
+        {"id": "PURR/USDC", "categoryId": "spot", "isDelisted": False},
+        {"id": "@1", "categoryId": "spot", "isDelisted": False},
+    ]
+}
+
+
+async def test_symbols_come_from_lifi_and_include_hip3_dexes():
+    client = _client()
+    client._api.request.side_effect = [_response(200, _MARKETS)]
+
+    symbols = await client.get_symbols()
+
+    # Native `meta` lists no HIP-3 coin, so the LI.FI feed is the only source that can
+    # offer xyz:/io: markets for the strategy to validate against.
+    assert symbols == ["BTC", "xyz:XYZ100", "io:ETH"]
+    call = client._api.request.await_args_list[0]
+    assert call.args == ("GET", "/markets")
+    assert call.kwargs["params"] == {"provider": "hyperliquid"}
+
+
+async def test_symbols_drop_spot_and_delisted_markets():
+    client = _client()
+    client._api.request.side_effect = [_response(200, _MARKETS)]
+
+    symbols = await client.get_symbols()
+
+    assert "PURR/USDC" not in symbols and "@1" not in symbols  # not perps
+    assert "xyz:OLDCO" not in symbols  # delisted markets stay in the feed
+
+
+async def test_a_hip3_symbol_must_carry_its_dex_prefix():
+    client = _client()
+    client._api.request.side_effect = [_response(200, _MARKETS)]
+
+    symbols = await client.get_symbols()
+
+    # A bare equity/index ticker is never routable: it reads as a native HL coin.
+    assert "XYZ100" not in symbols
+    assert "xyz:XYZ100" in symbols
+
+
+async def test_market_lookup_failure_is_reported():
+    client = _client()
+    client._api.request.side_effect = [_response(500, {})]
+
+    with pytest.raises(ApiError):
+        await client.get_symbols()
