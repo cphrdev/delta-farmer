@@ -407,7 +407,12 @@ async def test_close_position_does_not_hide_other_api_errors(client):
     ("asset", "expected"),
     [
         (
-            OmniSupportedAsset(asset="BTC", has_perp=True, instrument_type="perpetual_future"),
+            OmniSupportedAsset(
+                asset="BTC",
+                has_perp=True,
+                instrument_type="perpetual_future",
+                funding_interval_s=28800,
+            ),
             {
                 "underlying": "BTC",
                 "settlement_asset": "USDC",

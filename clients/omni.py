@@ -702,9 +702,9 @@ class OmniClient:
                 0 if asset is None or asset.funding_interval_s is None else asset.funding_interval_s
             )
         elif instrument_type == "perpetual_future":
-            instrument["funding_interval_s"] = (
-                3600 if asset is None or asset.funding_interval_s is None else asset.funding_interval_s
-            )
+            # Instrument id is always P-<asset>-USDC-3600. Metadata funding_interval_s
+            # is the settlement window (28800 for BTC) and is rejected by the quote API.
+            instrument["funding_interval_s"] = 3600
         if asset and asset.asset_class:
             instrument["kind"] = asset.asset_class
         return instrument
