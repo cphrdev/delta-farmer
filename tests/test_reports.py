@@ -57,6 +57,59 @@ def test_stats_snapshot_uses_stats_folder(tmp_path, monkeypatch):
     assert "W01" in text
 
 
+def _stats_text(tmp_path, **kwargs) -> str:
+    reports.begin("stats", "arcus")
+    render_stats(
+        {"W01": [PeriodRow("acc1", 2, Decimal(1000), Decimal(7), Decimal(3), Decimal("0.5"))]},
+        ["W01"],
+        **kwargs,
+    )
+    path = reports.flush()
+    assert path is not None
+    return path.read_text()
+
+
+def test_stats_hides_points_when_the_exchange_has_no_per_period_points(tmp_path, monkeypatch):
+    """Arcus reports points only as a season total, so a weekly 0 would be misleading."""
+    monkeypatch.chdir(tmp_path)
+
+    text = _stats_text(tmp_path, points=False)
+
+    assert "Points" not in text
+    assert "P/Price" not in text  # derived from Points, so it goes too
+    assert "Burn" in text and "$/100k" in text and "Total Vol" in text
+    assert "1,000" in text and "7.00" in text  # values still land in the right columns
+
+
+def test_stats_shows_points_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    text = _stats_text(tmp_path)
+
+    assert "Points" in text and "P/Price" in text
+    assert "3.00" in text
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, ("Points", "Fees")),
+        ({"fees": False}, ("Points",)),
+        ({"points": False}, ("Fees",)),
+        ({"points": False, "fees": False}, ()),
+    ],
+)
+def test_every_flag_combination_keeps_values_aligned(tmp_path, monkeypatch, kwargs, expected):
+    # add_row is positional, so a dropped column must drop its value too.
+    monkeypatch.chdir(tmp_path)
+
+    text = _stats_text(tmp_path, **kwargs)
+
+    for name in ("Points", "Fees"):
+        assert (name in text) == (name in expected)
+    assert "acc1" in text and "1,000" in text and "7.00" in text
+
+
 def test_print_without_begin_does_not_write(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     AutoTable(Column("Account", justify="left")).print()

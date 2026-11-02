@@ -15,6 +15,7 @@ Reads (/account, /positions, /markets, /bbo, /order) need no auth at all.
 import asyncio
 import json
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -57,6 +58,12 @@ PRIVY_STATEMENT = (
 )
 PRIVY_TOKEN_TTL = timedelta(minutes=45)  # identity tokens are short-lived
 
+# History endpoints: 1000 rows per page, no cursor, and `from`/`to` are epoch
+# microseconds with a hard floor the API enforces (smaller values are a 400).
+_HISTORY_PAGE = 1000
+_HISTORY_MAX_PAGES = 50
+_MIN_MICROS = 100_000_000_000_000
+
 # API key labels are visible in the Arcus UI and identical names across accounts would
 # link them. Derived from the address so each account gets its own stable, unrevealing
 # name rather than a shared literal.
@@ -69,6 +76,48 @@ _NAME_TAILS = (
     "alpha", "arc", "beam", "capital", "edge", "flow", "grid", "labs",
     "markets", "node", "quant", "signal", "stack", "systems", "vector", "works",
 )  # fmt: skip
+
+
+POINTS_WEEK = timedelta(days=7)
+
+
+def points_week_window(boundaries: Sequence[datetime], dt: datetime) -> tuple[datetime, datetime]:
+    """The drop window [start, end) that pays trading at `dt`.
+
+    `end` is the drop instant, `start` the drop before it. Real boundaries from the
+    API are used wherever they exist, because the schedule is anchored to a US local
+    time and shifts by an hour across DST (observed: a 19:00Z drop followed by a
+    20:00Z one). Only outside the known range is the week extrapolated in 7-day
+    steps, which is why trades are never silently re-bucketed by that drift.
+    """
+    assert boundaries, "at least one drop boundary is required"
+    first, last = boundaries[0], boundaries[-1]
+
+    if dt >= last:  # after the last known drop: extend the schedule forward
+        end = last + POINTS_WEEK * ((dt - last) // POINTS_WEEK + 1)
+        return end - POINTS_WEEK, end
+
+    if dt < first - POINTS_WEEK:  # before the first known drop: extend it backward
+        gap = first - dt - timedelta(microseconds=1)
+        end = first - POINTS_WEEK * (gap // POINTS_WEEK)
+        return end - POINTS_WEEK, end
+
+    # Inside the known schedule, so both edges are real drops and the window is
+    # whatever Arcus actually used - 7d1h across a DST change, not a clean 7 days.
+    end = next(b for b in boundaries if dt < b)
+    earlier = [b for b in boundaries if b < end]
+    return (earlier[-1] if earlier else end - POINTS_WEEK), end
+
+
+def points_week_label(start: datetime, end: datetime) -> str:
+    """Sortable label for a drop window, e.g. '2026-W44 Oct21-Oct28'.
+
+    Numbered by the ISO week of the drop. Drops are weekly, so consecutive drops fall
+    in consecutive ISO weeks and the numbers never collide; the ISO year keeps labels
+    sorting correctly across a year boundary.
+    """
+    iso_year, iso_week, _ = end.isocalendar()
+    return f"{iso_year}-W{iso_week:02d} {start:%b%d}-{end:%b%d}"
 
 
 def api_wallet_name(address: str) -> str:
@@ -211,14 +260,41 @@ class ArcusSeason(BaseModel):
     points: Decimal = Decimal(0)
 
 
+class ArcusPointsWeek(BaseModel):
+    """One weekly points drop.
+
+    `distributed_at` is when the drop landed and it pays trading in the preceding
+    seven days, i.e. the window [distributed_at - 7d, distributed_at). Measured, not
+    assumed: over the 2026-10-28 drop that window puts all three accounts at
+    81.3-82.8 points per $1M, while reading `week_start` as the start of the rewarded
+    week scatters them over 164-256 points per $1M.
+
+    `week_start` is a plain date and names the week the drop was paid in, so it is one
+    week ahead of the window it pays for. Bucket on `distributed_at`, not on this.
+    """
+
+    season: str | None = None
+    week_start: str | None = None
+    distributed_at: datetime | None = None
+    points: Decimal = Decimal(0)
+
+
 class ArcusPoints(BaseModel):
     season: str | None = None
     season_points: Decimal = Decimal(0)
     total_points: Decimal = Decimal(0)
     season_rank: int | None = None
     tier: str | None = None
-    next_drop_at: str | None = None
+    next_drop_at: datetime | None = None
     seasons: list[ArcusSeason] = Field(default_factory=list)
+    weekly: list[ArcusPointsWeek] = Field(default_factory=list)
+
+    def drop_boundaries(self) -> list[datetime]:
+        """Every drop instant this account knows about, including the pending one."""
+        out = [w.distributed_at for w in self.weekly if w.distributed_at]
+        if self.next_drop_at:
+            out.append(self.next_drop_at)
+        return sorted(set(out))
 
 
 class ArcusLeaderboard(BaseModel):
@@ -236,6 +312,50 @@ class ArcusStats(BaseModel):
 
     lifetimeVolume: Decimal = Decimal(0)
     lifetimeFeesPaid: Decimal = Decimal(0)
+
+
+class ArcusFill(BaseModel):
+    """One trade fill. Unlike /v1/account/stats these are plain decimals, not quantums.
+
+    `closedPnl` is already NET of this fill's fee (docs: "cost-basis release ... minus
+    the fill's fee"), so opening legs carry exactly -fee. Do not subtract `fee` again.
+    """
+
+    tradeId: str
+    marketDisplayName: str = ""
+    side: str = ""
+    role: str = ""
+    size: Decimal = Decimal(0)
+    price: Decimal = Decimal(0)
+    fee: Decimal = Decimal(0)
+    closedPnl: Decimal = Decimal(0)
+    createdAt: int = 0  # epoch microseconds
+
+    @property
+    def created_at(self) -> datetime:
+        return datetime.fromtimestamp(self.createdAt / 1e6, tz=UTC)
+
+    @property
+    def volume(self) -> Decimal:
+        return self.price * self.size
+
+
+class ArcusFunding(BaseModel):
+    """One funding payment. `payment` is signed: positive means received."""
+
+    marketId: int = 0
+    marketDisplayName: str = ""
+    payment: Decimal = Decimal(0)
+    time: int = 0  # epoch microseconds
+
+    @property
+    def id(self) -> str:
+        # The endpoint exposes no payment id; one market settles once per timestamp.
+        return f"{self.marketId}-{self.time}"
+
+    @property
+    def created_at(self) -> datetime:
+        return datetime.fromtimestamp(self.time / 1e6, tz=UTC)
 
 
 @bind_log_context
@@ -551,6 +671,46 @@ class ArcusClient:
     async def stats(self) -> ArcusStats:
         res = await self._call("GET", f"/v1/account/stats?address={self.address}&include=volumes")
         return ArcusStats(**res) if res else ArcusStats()
+
+    async def _history(
+        self, path: str, key: str, ts_field: str, since: datetime | None
+    ) -> list[dict]:
+        """Page one Arcus history endpoint, oldest bound inclusive.
+
+        `limit` caps a page at 1000 and the API defines no cursor, so pages walk
+        backwards by moving `to` to the oldest timestamp of the previous page. Both
+        bounds are inclusive, so pages overlap by one record and the caller dedupes.
+        An explicit `from` is required: omitted, the API silently answers with only
+        the last 30 days rather than the full history.
+        """
+        frm = max(int(since.timestamp() * 1_000_000), _MIN_MICROS) if since else _MIN_MICROS
+        to: int | None = None
+        out: list[dict] = []
+        for _ in range(_HISTORY_MAX_PAGES):
+            qs = (
+                f"address={self.address}&accountIndex={self.account_index}"
+                f"&limit={_HISTORY_PAGE}&from={frm}"
+            )
+            res = await self._call("GET", f"{path}?{qs}" + (f"&to={to}" if to else ""))
+            page: list[dict] = (res or {}).get(key) or []
+            out.extend(page)
+            if len(page) < _HISTORY_PAGE:
+                return out
+            oldest = min(int(r[ts_field]) for r in page)
+            if oldest <= frm:
+                return out
+            to = oldest
+        logger.warning(f"{path}: stopped after {_HISTORY_MAX_PAGES} pages, history may be partial")
+        return out
+
+    async def fills(self, since: datetime | None = None) -> list[ArcusFill]:
+        raw = await self._history("/v1/fills", "fills", "createdAt", since)
+        return [ArcusFill(**r) for r in {str(r["tradeId"]): r for r in raw}.values()]
+
+    async def funding_payments(self, since: datetime | None = None) -> list[ArcusFunding]:
+        raw = await self._history("/v1/funding", "fundingPayments", "time", since)
+        uniq = {f"{r.get('marketId')}-{r.get('time')}": r for r in raw}
+        return [ArcusFunding(**r) for r in uniq.values()]
 
     async def profile(self) -> ProfileInfo:
         account, stats, points, board = await asyncio.gather(
