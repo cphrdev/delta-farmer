@@ -226,7 +226,7 @@ symbols_per_trade = 2
 
 Jumper trades native Hyperliquid markets through [LI.FI's perps API](https://public-perps-docs.mintlify.app), which is the API behind Jumper Perps. Orders are sent with no API key, so they carry LI.FI's default builder fee and show up in Jumper's activity record. Balances, positions, and order status are still read from Hyperliquid.
 
-Deposit on Hyperliquid first. The first `login` accepts Jumper's current terms, approves a trading agent derived from the account key, and approves the builder fee. That builder fee is charged on fills in addition to Hyperliquid's own fee. Jumper does not publish an xPerps balance, so `info` shows Hyperliquid volume and P/L.
+Deposit on Hyperliquid first. The first `login` accepts Jumper's current terms, approves a trading agent derived from the account key, and approves the builder fee. That builder fee is charged on fills in addition to Hyperliquid's own fee. `info` shows Hyperliquid volume and P/L, plus all-time xPerps and the current week's estimate from `GET https://api.jumper.xyz/v1/points/{address}`.
 
 ```bash
 uv run apps/jumper.py config new

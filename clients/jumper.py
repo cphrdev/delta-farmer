@@ -2,6 +2,7 @@
 # Copyright (c) vladkens | MIT License | Built by humans, blamed on AI
 import asyncio
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -14,11 +15,12 @@ from lib.decorators import bind_log_context, locked, ttl_cache
 from lib.errors import AppError
 from lib.http import ApiError, AsyncHttp
 from lib.logger import logger
-from strategy import Order, OrderStatus, Side, TradingClient
+from strategy import Order, OrderStatus, ProfileInfo, Side, TradingClient
 
 from .hyperliquid import HyperLiquidClient, _fmt
 
 PERPS_API = "https://li.quest/v1/perps"
+POINTS_API = "https://api.jumper.xyz"
 PROVIDER = "hyperliquid"
 META = "meta"
 TERMS_NOT_ACCEPTED = 2012
@@ -86,6 +88,33 @@ def sign_typed_data(account: LocalAccount, typed_data: dict) -> str:
     return "0x" + bytes(signature).hex()
 
 
+@dataclass(frozen=True)
+class JumperPoints:
+    total: Decimal
+    week: Decimal
+
+
+class JumperProfile(ProfileInfo):
+    week_points: Decimal = Decimal(0)
+
+
+def _points_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, ValueError, TypeError):
+        raise ApiError("Jumper points response is missing points") from None
+
+
+def read_points(body: Any) -> JumperPoints:
+    """All-time xPerps (`points`) and the open week's estimate (`pointsEstimate`)."""
+    if not isinstance(body, dict) or "points" not in body:
+        raise ApiError("Jumper points response is missing points")
+    return JumperPoints(
+        total=_points_decimal(body["points"]),
+        week=_points_decimal(body.get("pointsEstimate", 0)),
+    )
+
+
 def action_error_code(body: Any) -> int | None:
     if not isinstance(body, dict) or "code" not in body:
         return None
@@ -136,10 +165,44 @@ class JumperClient(HyperLiquidClient):
             headers={"Content-Type": "application/json"},
             proxy=proxy,
         )
+        # Without a Jumper origin the points API answers every request with 429.
+        self._points_http = AsyncHttp(
+            baseurl=POINTS_API,
+            headers={
+                "Accept": "application/json",
+                "Origin": "https://jumper.xyz",
+                "Referer": "https://jumper.xyz/",
+            },
+            proxy=proxy,
+        )
         self._ready = False
 
     async def close(self) -> None:
-        await asyncio.gather(self.http.close(), self._api.close())
+        await asyncio.gather(self.http.close(), self._api.close(), self._points_http.close())
+
+    async def points(self) -> JumperPoints:
+        rep = await self._points_http.request("GET", f"/v1/points/{self.address}")
+        try:
+            body = rep.json()
+        except ValueError:
+            body = None
+        if not rep.ok:
+            raise ApiError("Jumper points", rep)
+        return read_points(body)
+
+    async def profile(self) -> JumperProfile:
+        info, points = await asyncio.gather(
+            super().profile(), self.points(), return_exceptions=True
+        )
+        if isinstance(info, BaseException):
+            raise info
+        if isinstance(points, BaseException):
+            logger.warning(f"points unavailable: {points}")
+            points = JumperPoints(total=Decimal(0), week=Decimal(0))
+        reported = info.model_dump()
+        reported["points"] = points.total
+        reported["week_points"] = points.week
+        return JumperProfile(**reported)
 
     async def login(self, *, force: bool = False) -> str:
         if not await self.registered():
