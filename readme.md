@@ -251,7 +251,7 @@ uv run apps/jumper.py info
 uv run apps/jumper.py trade
 ```
 
-`deposit`, `withdraw`, and `stats` are not available. Close everything with `uv run apps/jumper.py close`.
+`deposit`, `withdraw`, and `stats` are not available. Close everything with `uv run apps/jumper.py close`. Jumper is not pinned to one HIP-3 namespace, so if this wallet also runs another Hyperliquid app see [Sharing one wallet between Hyperliquid apps](#sharing-one-wallet-between-hyperliquid-apps).
 
 ### Trade.xyz
 
@@ -337,6 +337,25 @@ uv run apps/entropy.py close
 ```
 
 If `info` reports an account mode other than `unifiedAccount`, close active positions and orders before running `uv run apps/entropy.py migrate`. Built-in `deposit`, `withdraw`, and `stats` commands are not available for Entropy.
+
+### Sharing one wallet between Hyperliquid apps
+
+Several launchers trade the same Hyperliquid account: `hyperliquid` on the native markets, `jumper` through LI.FI, `tradexyz` on the `xyz` HIP-3 markets, and `entropy` on `io`. Running two of them with the same keys is supported, but cleanup needs one setting.
+
+`tradexyz` and `entropy` are pinned to a single namespace and only ever read, cancel, and close their own markets. `hyperliquid` and `jumper` are not pinned, so by default they enumerate every HIP-3 dex on the wallet. Their trade-cycle cleanup, `positions`, and `close` therefore cover everything the account holds — including positions another launcher opened. The pinned apps never do the reverse, so the effect is one-sided: `jumper close` will close Entropy's `io:` legs, while `entropy close` leaves Jumper's alone.
+
+Set `scope_cleanup` to limit an app to the markets its own config trades:
+
+```toml
+scope_cleanup = true
+symbols = ["xyz:SP500"]
+```
+
+It defaults to `false`, which keeps the sweep-everything behaviour. Turn it on in each config that shares a wallet. The setting is top-level, next to `symbols`, not inside a pool.
+
+Scoping works per dex rather than per symbol, so a position left behind on a namespace this config still trades is cleaned up normally — `scope_cleanup` with `symbols = ["xyz:SP500"]` will still close an orphaned `xyz:XYZ100`. Only other namespaces become out of reach. It changes nothing for `tradexyz` or `entropy`, which are already scoped by their namespace.
+
+If you deliberately want one launcher to clear everything on a wallet, leave the flag off, or run `close` from the app that owns the markets you want closed.
 
 ### Named pools
 

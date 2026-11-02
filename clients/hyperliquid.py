@@ -95,6 +95,8 @@ class HyperLiquidClient:
         self.name = name
         self.account: LocalAccount = utils.parse_eth_key(privkey, name)
         self.address: str = self.account.address
+        # Dexes this client owns, set by scope_markets(). None = every dex on the wallet.
+        self._dex_scope: frozenset[str] | None = None
         self.http = AsyncHttp(
             baseurl=HL_API,
             headers={"Content-Type": "application/json"},
@@ -221,8 +223,7 @@ class HyperLiquidClient:
 
         pnl = sum(
             (
-                Decimal(str(fill.get("closedPnl", 0)))
-                - Decimal(str(fill.get("fee", 0)))
+                Decimal(str(fill.get("closedPnl", 0))) - Decimal(str(fill.get("fee", 0)))
                 for fill in fills
                 if str(fill.get("coin", "")).startswith(prefixes)
             ),
@@ -476,11 +477,26 @@ class HyperLiquidClient:
 
     # MARK: Positions
 
+    def scope_markets(self, symbols: Sequence[str]) -> None:
+        """Restrict position and order sweeps to the dexes `symbols` live on.
+
+        One wallet commonly runs several HIP-3 apps at once - jumper on `xyz:`,
+        entropy on `io:` - against the same Hyperliquid account. A client with no
+        dex_prefix enumerates every dex, so without a scope its cleanup closes the
+        other app's positions and cancels its orders. Scoping by dex rather than by
+        exact symbol keeps orphan recovery working: a leftover `xyz:XYZ100` is still
+        cleaned up by a client configured only for `xyz:SP500`.
+        """
+        self._dex_scope = frozenset(self._resolve(symbol)[0] for symbol in symbols)
+
     async def _dex_names(self) -> list[str]:
         # HL API: clearinghouseState `dex` param defaults to "" (native HL only), no "all" option.
-        # Must query each DEX separately. Single-DEX clients use dex_prefix; aggregators query all.
+        # Must query each DEX separately. Single-DEX clients use dex_prefix; a client without
+        # one uses its configured scope, and falls back to every dex when nothing scoped it.
         if self.dex_prefix:
             return [self.dex_prefix]
+        if self._dex_scope is not None:
+            return sorted(self._dex_scope)
         return [""] + [d["name"] for d in await self._info(type="perpDexs") if d]
 
     async def positions(self) -> list[Position]:

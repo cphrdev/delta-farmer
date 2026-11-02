@@ -284,6 +284,26 @@ class AppConfig(BaseModel):
     strategy: TradeConfig | None = Field(None, exclude=True, repr=False)
     balance_transfer_delay: TimeRange = TimeRange(min=DurationSec("2m"), max=DurationSec("4m"))
     telegram: TgConfig = Field(default_factory=lambda: TgConfig())
+    # Opt-in: limit position and order cleanup to the dexes `all_symbols` lives on.
+    # Off by default, so cleanup keeps sweeping every market on the wallet. Turn it on
+    # when several apps share one wallet - on Hyperliquid a client with no dex_prefix
+    # (jumper, hyperliquid) otherwise closes another app's positions, e.g. jumper's
+    # cleanup closing entropy's `io:` legs. Only affects clients that can be scoped.
+    scope_cleanup: bool = False
+
+    @property
+    def all_symbols(self) -> list[str]:
+        """Every symbol any pool of this app may trade, in config order.
+
+        Used to scope cleanup to the markets this app owns, so one exchange app
+        does not close positions another app opened on the same wallet.
+        """
+        out: list[str] = []
+        for pool in self.pools.values():
+            out.extend(pool.symbols)
+        if self.strategy is not None:
+            out.extend(self.strategy.symbols)
+        return list(dict.fromkeys(out))
 
     @model_validator(mode="before")
     @classmethod
