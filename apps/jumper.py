@@ -15,13 +15,15 @@ async def print_info(accs: list[JumperClient]) -> None:
         Column("Address", justify="left"),
         Column("HL Volume", "{:,.0f}", total=sum),
         Column("Burn", "{:,.2f}", total=sum),
+        Column("Points", "{:,.2f}", total=sum),
+        Column("Est. Week", "{:,.2f}", total=sum),
         Column("Balance", "{:,.2f}", total=sum),
     )
 
     async def row(acc: JumperClient):
         registered = await acc.registered()
         if not registered:
-            return ("✗", acc.name, short_addr(acc.address), 0, 0, 0)
+            return ("✗", acc.name, short_addr(acc.address), 0, 0, 0, 0, 0)
         profile = await acc.profile()
         return (
             "✓",
@@ -29,6 +31,8 @@ async def print_info(accs: list[JumperClient]) -> None:
             short_addr(acc.address),
             profile.volume,
             -profile.pnl,
+            profile.points,
+            profile.week_points,
             profile.balance,
         )
 

@@ -10,6 +10,7 @@ from clients.jumper import (
     market_ref,
     order_params,
     read_action_result,
+    read_points,
     sign_typed_data,
 )
 from lib.http import ApiError
@@ -303,3 +304,47 @@ async def test_market_lookup_failure_is_reported():
 
     with pytest.raises(ApiError):
         await client.get_symbols()
+
+
+def test_points_split_all_time_from_the_open_week():
+    parsed = read_points({"points": 806, "pointsEstimate": 42434, "weeks": []})
+
+    assert parsed.total == Decimal(806)
+    assert parsed.week == Decimal(42434)
+    assert read_points({"points": "12.5"}).week == Decimal(0)
+
+    with pytest.raises(ApiError, match="missing points"):
+        read_points({"pointsEstimate": 3})
+
+
+async def test_profile_reports_settled_xperps():
+    client = _client()
+    client.balance = AsyncMock(return_value=Decimal("10"))
+    client._info = AsyncMock(
+        return_value=[["perpAllTime", {"vlm": "1000", "pnlHistory": [[1, "-3.25"]]}]]
+    )
+    client._points_http = Mock(
+        request=AsyncMock(return_value=_response(200, {"points": "12.5", "pointsEstimate": 1}))
+    )
+
+    profile = await client.profile()
+
+    assert profile.points == Decimal("12.5")
+    assert profile.week_points == Decimal(1)
+    assert profile.volume == Decimal("1000")
+    assert profile.balance == Decimal("10")
+    client._points_http.request.assert_awaited_once_with("GET", f"/v1/points/{client.address}")
+
+
+async def test_profile_keeps_the_account_when_points_are_unavailable():
+    client = _client()
+    client.balance = AsyncMock(return_value=Decimal("10"))
+    client._info = AsyncMock(return_value=[["perpAllTime", {"vlm": "4", "pnlHistory": [[1, "0"]]}]])
+    client._points_http = Mock(request=AsyncMock(return_value=_response(500, {})))
+
+    profile = await client.profile()
+
+    assert profile.points == Decimal(0)
+    assert profile.week_points == Decimal(0)
+    assert profile.balance == Decimal("10")
+    assert profile.volume == Decimal("4")
