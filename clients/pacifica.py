@@ -85,8 +85,8 @@ class PacificaOrder(BaseModel):
 
 class PacificaTrade(BaseModel):
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
-    trade_id: int = Field(..., alias="history_id")
-    order_id: int
+    trade_id: int|str |None = Field(..., alias="history_id")
+    order_id: int | str | None
     symbol: str
     side: Literal["open_long", "open_short", "close_long", "close_short"]
     price: Decimal
