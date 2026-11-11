@@ -1,9 +1,15 @@
+from datetime import UTC, datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
+import pytest
+
+from apps.hyperliquid import HyperLiquidNativeClient
 from clients.entropy import EntropyClient
-from clients.hyperliquid import HyperLiquidClient
+from clients.hyperliquid import MAX_USER_FILLS_HISTORY, HyperLiquidClient
 from clients.jumper import JumperClient
 from lib.cli import _scope_markets
+from lib.http import ApiError
 from strategy.models import AppConfig
 
 KEY = "0x" + "03" * 32
@@ -16,6 +22,116 @@ WALLET = {
     "io": [("io:NBIS", "3")],
     "hyna": [("hyna:ETH", "4")],
 }
+
+
+async def test_native_volume_fetches_all_time_and_excludes_hip3_fills():
+    client = HyperLiquidNativeClient("test", KEY)
+    first_page = [
+        {"coin": "BTC", "px": "2", "sz": "3", "time": i} for i in range(2000)
+    ]
+    calls: list[dict] = []
+
+    async def info(**kwargs):
+        calls.append(kwargs)
+        return first_page if len(calls) == 1 else [
+            {"coin": "ETH", "px": "4", "sz": "5", "time": 2000},
+            {"coin": "xyz:SP500", "px": "100", "sz": "7", "time": 2001},
+        ]
+
+    client._info = info
+
+    assert await client.volume() == Decimal("12020")
+    assert calls == [
+        {
+            "type": "userFillsByTime",
+            "user": client.address,
+            "startTime": 0,
+            "aggregateByTime": True,
+        },
+        {
+            "type": "userFillsByTime",
+            "user": client.address,
+            "startTime": 2000,
+            "aggregateByTime": True,
+        },
+    ]
+
+
+async def test_portfolio_volume_reads_the_ui_all_time_aggregate():
+    client = HyperLiquidNativeClient("test", KEY)
+    client._info = AsyncMock(
+        return_value=[
+            ["perpAllTime", {"vlm": "1107290"}],
+            ["allTime", {"vlm": "2652152.04"}],
+        ]
+    )
+
+    assert await client.portfolio_volume("allTime") == Decimal("2652152.04")
+    client._info.assert_awaited_once_with(type="portfolio", user=client.address)
+
+
+async def test_portfolio_volume_rejects_a_missing_period():
+    client = HyperLiquidNativeClient("test", KEY)
+    client._info = AsyncMock(return_value=[])
+
+    with pytest.raises(ApiError, match="Portfolio period not found: allTime"):
+        await client.portfolio_volume("allTime")
+
+
+async def test_staked_hype_reads_delegated_amount():
+    client = HyperLiquidNativeClient("test", KEY)
+    client._info = AsyncMock(
+        return_value={
+            "delegated": "10.25",
+            "undelegated": "2",
+            "totalPendingWithdrawal": "1",
+        }
+    )
+
+    assert await client.staked_hype() == Decimal("10.25")
+    client._info.assert_awaited_once_with(type="delegatorSummary", user=client.address)
+
+
+async def test_hype_price_reads_native_mid_price():
+    client = HyperLiquidNativeClient("test", KEY)
+    client._info = AsyncMock(return_value={"BTC": "100000", "HYPE": "72.684"})
+
+    assert await client.hype_price() == Decimal("72.684")
+    client._info.assert_awaited_once_with(type="allMids")
+
+
+async def test_hype_price_rejects_missing_market():
+    client = HyperLiquidNativeClient("test", KEY)
+    client._info = AsyncMock(return_value={"BTC": "100000"})
+
+    with pytest.raises(ApiError, match="HYPE mid price missing"):
+        await client.hype_price()
+
+
+async def test_volume_since_is_exact_when_fill_history_is_below_the_limit():
+    client = HyperLiquidNativeClient("test", KEY)
+    client._fetch_fills = AsyncMock(
+        return_value=[{"coin": "BTC", "px": "10", "sz": "2", "time": 1_733_184_000_000}]
+    )
+    since = datetime(2024, 11, 29, tzinfo=UTC)
+
+    assert await client.volume_since(since) == (Decimal("20"), True)
+    client._fetch_fills.assert_awaited_once_with(since)
+
+
+async def test_volume_since_marks_capped_history_as_a_lower_bound():
+    client = HyperLiquidNativeClient("test", KEY)
+    client._fetch_fills = AsyncMock(
+        return_value=[
+            {"coin": "BTC", "px": "1", "sz": "1", "time": 1_733_184_000_001}
+        ]
+        * MAX_USER_FILLS_HISTORY
+    )
+
+    assert await client.volume_since(datetime(2024, 11, 29, tzinfo=UTC)) == (
+        Decimal(MAX_USER_FILLS_HISTORY),
+        False,
+    )
 
 
 def _fake_info(client, seen: list[str | None]):

@@ -24,6 +24,7 @@ from strategy import Order, OrderBook, OrderStatus, Position, ProfileInfo, Side,
 
 HL_API = "https://api.hyperliquid.xyz"
 MIN_SESSION_FUNDING_USD = Decimal("10")
+MAX_USER_FILLS_HISTORY = 10_000
 
 _AGENT_DOMAIN = {
     "name": "Exchange",
@@ -246,6 +247,18 @@ class HyperLiquidClient:
             Decimal(0),
         )
 
+    async def volume_since(self, since: datetime) -> tuple[Decimal, bool]:
+        """Return volume since a date and whether the public fill history is complete."""
+        fills = await self._fetch_fills(since)
+        volume = sum(
+            (abs(Decimal(str(fill["px"])) * Decimal(str(fill["sz"]))) for fill in fills),
+            Decimal(0),
+        )
+        first_time = min((int(fill["time"]) for fill in fills), default=None)
+        since_ms = int(since.timestamp() * 1000)
+        complete = len(fills) < MAX_USER_FILLS_HISTORY or first_time == since_ms
+        return volume, complete
+
     def _sign_l1_action(self, action: dict, nonce: int) -> dict:
         data: bytes = msgpack.packb(action, use_bin_type=True)  # type: ignore[assignment]
         data += struct.pack(">Q", nonce)
@@ -420,6 +433,17 @@ class HyperLiquidClient:
             return "unknown"
 
         return data if isinstance(data, str) else "unknown"
+
+    async def staked_hype(self) -> Decimal:
+        summary = await self._info(type="delegatorSummary", user=self.address)
+        return Decimal(str(summary.get("delegated", 0)))
+
+    async def hype_price(self) -> Decimal:
+        mids = await self._info(type="allMids")
+        try:
+            return Decimal(str(mids["HYPE"]))
+        except (KeyError, TypeError):
+            raise ApiError("HYPE mid price missing from allMids") from None
 
     async def set_account_mode(self, mode: str = "unifiedAccount") -> None:
         if mode not in ("disabled", "unifiedAccount", "portfolioMargin"):
@@ -663,6 +687,14 @@ class HyperLiquidClient:
         return total
 
     # MARK: Profile
+
+    async def portfolio_volume(self, period: str = "perpAllTime") -> Decimal:
+        """Return Hyperliquid's authoritative volume aggregate for a portfolio period."""
+        portfolio = await self._info(type="portfolio", user=self.address)
+        for period_name, period_data in portfolio:
+            if period_name == period:
+                return Decimal(str(period_data.get("vlm", 0)))
+        raise ApiError(f"Portfolio period not found: {period}")
 
     async def profile(self) -> ProfileInfo:
         bal, portfolio = await asyncio.gather(
